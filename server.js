@@ -27,8 +27,8 @@ app.use((req, res, next) => {
   if (origin && ALLOWED_ORIGINS.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Methods", "GET, PUT, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Allow-Methods", "GET, PUT, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Finappa-Key");
   }
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -188,6 +188,261 @@ setTimeout(() => checkSubscriptionsAndNotify(false).catch(() => {}), 15 * 1000);
 /* Ручной прогон крона (для отладки): не шлёт вне окна, если не передать force */
 app.post("/api/push/run-check", async (req, res) => {
   await checkSubscriptionsAndNotify(!!(req.body && req.body.force));
+  res.json({ ok: true });
+});
+
+/* ─────────────── Этап 5а: общие кошельки ───────────────
+   Кошелёк, которым владелец поделился, живёт отдельной записью на сервере.
+   Личность отделена от секрета: userId = sha256(deviceKey). Ключ передаётся
+   заголовком X-Finappa-Key и наружу (другим участникам) никогда не уходит. */
+
+const crypto = require("crypto");
+
+const SHARED_DIR = path.join(DATA_DIR, "shared");
+const INVITE_DIR = path.join(DATA_DIR, "invites");
+fs.mkdirSync(SHARED_DIR, { recursive: true });
+fs.mkdirSync(INVITE_DIR, { recursive: true });
+
+const SID_RE = /^sw-[a-f0-9]{16}$/;
+const MAX_MEMBERS = 5;
+const MAX_TXS = 20000;
+const INVITE_TTL_MS = 48 * 3600 * 1000;
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // без похожих I,O,0,1
+
+const userIdOf = (deviceKey) =>
+  crypto.createHash("sha256").update(String(deviceKey)).digest("hex").slice(0, 16);
+
+const sharedPath = (sid) => path.join(SHARED_DIR, sid + ".json");
+const codePath = (code) => path.join(INVITE_DIR, code + ".json");
+
+function auth(req, res, next) {
+  const key = req.headers["x-finappa-key"];
+  if (!key || !KEY_RE.test(String(key))) return res.status(401).json({ error: "auth required" });
+  req.userId = userIdOf(key);
+  next();
+}
+
+function loadShared(sid) {
+  if (!SID_RE.test(String(sid))) return null;
+  return readJson(sharedPath(sid), null);
+}
+
+const money = (o) =>
+  o && typeof o === "object"
+    ? { amount: Number(o.amount) || 0, currency: String(o.currency || "").slice(0, 5) }
+    : null;
+
+/* Нормализация операции: с клиента приходит только то, что нужно для баланса
+   и показа. Категории денормализованы (имя+эмодзи), чтобы гостю не нужен был
+   справочник владельца. */
+function sanitizeTx(t, fallbackAuthor) {
+  if (!t || typeof t.id !== "string" || !t.id || t.id.length > 40) return null;
+  const kind = t.kind === "transfer" ? "transfer" : t.kind === "income" ? "income" : "expense";
+  const out = {
+    id: t.id,
+    kind,
+    date: typeof t.date === "string" ? t.date.slice(0, 10) : "",
+    comment: typeof t.comment === "string" ? t.comment.slice(0, 200) : "",
+    authorId: typeof t.authorId === "string" && t.authorId.length <= 32 ? t.authorId : fallbackAuthor,
+    updatedAt: Number(t.updatedAt) || Date.now(),
+    deleted: !!t.deleted,
+  };
+  if (kind === "transfer") {
+    out.out = money(t.out);
+    out.in = money(t.in);
+    if (!out.out && !out.in) return null;
+  } else {
+    out.amount = Number(t.amount) || 0;
+    out.currency = String(t.currency || "").slice(0, 5);
+    out.catName = String(t.catName || "").slice(0, 40);
+    out.catEmoji = String(t.catEmoji || "").slice(0, 8);
+  }
+  return out;
+}
+
+const sanitizeTxs = (arr, author) =>
+  (Array.isArray(arr) ? arr : []).slice(0, MAX_TXS).map((t) => sanitizeTx(t, author)).filter(Boolean);
+
+const publicMembers = (rec) =>
+  rec.members.map((m) => ({ userId: m.userId, name: m.name, role: m.role }));
+
+function newCode() {
+  const b = crypto.randomBytes(8);
+  let s = "";
+  for (let i = 0; i < 8; i++) s += CODE_ALPHABET[b[i] % CODE_ALPHABET.length];
+  return s;
+}
+
+/* Подмести протухшие приглашения (дёшево, вызывается при выдаче нового) */
+function sweepInvites() {
+  try {
+    for (const f of fs.readdirSync(INVITE_DIR)) {
+      if (!f.endsWith(".json")) continue;
+      const inv = readJson(path.join(INVITE_DIR, f), null);
+      if (!inv || inv.used || Date.now() > inv.expiresAt) {
+        if (!inv || Date.now() > inv.expiresAt + INVITE_TTL_MS) fs.unlinkSync(path.join(INVITE_DIR, f));
+      }
+    }
+  } catch { /* не критично */ }
+}
+
+/* Открыть кошелёк для совместного доступа (первичная выгрузка снимка) */
+app.post("/api/shared/wallets", auth, (req, res) => {
+  const { name, currencies, ownerName, txs } = req.body || {};
+  if (typeof name !== "string" || !name.trim()) return res.status(400).json({ error: "name required" });
+  if (!Array.isArray(currencies) || !currencies.length) return res.status(400).json({ error: "currencies required" });
+  const sid = "sw-" + crypto.randomBytes(8).toString("hex");
+  const rec = {
+    id: sid,
+    ownerId: req.userId,
+    name: name.trim().slice(0, 60),
+    currencies: currencies.slice(0, 12).map((c) => String(c).slice(0, 5)),
+    members: [{
+      userId: req.userId,
+      name: String(ownerName || "Владелец").slice(0, 40),
+      role: "owner",
+      joinedAt: new Date().toISOString(),
+    }],
+    txs: sanitizeTxs(txs, req.userId),
+    updatedAt: new Date().toISOString(),
+  };
+  writeJson(sharedPath(sid), rec);
+  res.json({ sharedId: sid, members: publicMembers(rec), you: { userId: req.userId, role: "owner" }, updatedAt: rec.updatedAt });
+});
+
+/* Синхронизация: владелец толкает снимок, участник забирает */
+app.post("/api/shared/wallets/:sid/sync", auth, (req, res) => {
+  const rec = loadShared(req.params.sid);
+  if (!rec) return res.status(404).json({ error: "not found" });
+  const me = rec.members.find((m) => m.userId === req.userId);
+  if (!me) return res.status(403).json({ error: "forbidden" });
+
+  const body = req.body || {};
+  let changed = false;
+  if (me.role === "owner") {
+    if (typeof body.name === "string" && body.name.trim() && body.name.trim() !== rec.name) {
+      rec.name = body.name.trim().slice(0, 60);
+      changed = true;
+    }
+    if (Array.isArray(body.currencies) && body.currencies.length) {
+      const next = body.currencies.slice(0, 12).map((c) => String(c).slice(0, 5));
+      if (next.join(",") !== rec.currencies.join(",")) { rec.currencies = next; changed = true; }
+    }
+    if (Array.isArray(body.txs)) { rec.txs = sanitizeTxs(body.txs, req.userId); changed = true; }
+  } else if (Array.isArray(body.txs) && body.txs.length) {
+    /* 5а: гость только смотрит. Запись откроется в 5б. */
+    return res.status(403).json({ error: "read only" });
+  }
+  if (changed) {
+    rec.updatedAt = new Date().toISOString();
+    writeJson(sharedPath(rec.id), rec);
+  }
+
+  const owner = rec.members.find((m) => m.role === "owner") || { name: "" };
+  res.json({
+    name: rec.name,
+    currencies: rec.currencies,
+    members: publicMembers(rec),
+    ownerName: owner.name,
+    you: { userId: req.userId, name: me.name, role: me.role },
+    txs: me.role === "owner" ? [] : rec.txs,
+    updatedAt: rec.updatedAt,
+  });
+});
+
+/* Выдать одноразовый код приглашения (только владелец) */
+app.post("/api/shared/wallets/:sid/invites", auth, (req, res) => {
+  const rec = loadShared(req.params.sid);
+  if (!rec) return res.status(404).json({ error: "not found" });
+  if (rec.ownerId !== req.userId) return res.status(403).json({ error: "forbidden" });
+  if (rec.members.length >= MAX_MEMBERS) return res.status(409).json({ error: "too many members" });
+  sweepInvites();
+  const role = req.body && req.body.role === "write" ? "write" : "view";
+  const code = newCode();
+  const expiresAt = Date.now() + INVITE_TTL_MS;
+  writeJson(codePath(code), { code, sharedId: rec.id, role, createdBy: req.userId, expiresAt, used: false });
+  res.json({ code, role, expiresAt });
+});
+
+/* Присоединиться по коду */
+const acceptAttempts = new Map();
+app.post("/api/shared/invites/:code/accept", auth, (req, res) => {
+  const who = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "?").split(",")[0];
+  const a = acceptAttempts.get(who) || { n: 0, ts: Date.now() };
+  if (Date.now() - a.ts > 3600 * 1000) { a.n = 0; a.ts = Date.now(); }
+  a.n += 1;
+  acceptAttempts.set(who, a);
+  if (a.n > 20) return res.status(429).json({ error: "too many attempts" });
+
+  const code = String(req.params.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (code.length !== 8) return res.status(400).json({ error: "bad code" });
+  const inv = readJson(codePath(code), null);
+  if (!inv) return res.status(404).json({ error: "bad code" });
+  if (Date.now() > inv.expiresAt) return res.status(410).json({ error: "expired" });
+
+  const rec = loadShared(inv.sharedId);
+  if (!rec) return res.status(404).json({ error: "wallet gone" });
+  if (rec.ownerId === req.userId) return res.status(409).json({ error: "own wallet" });
+
+  let me = rec.members.find((m) => m.userId === req.userId);
+  if (!me) {
+    if (inv.used) return res.status(409).json({ error: "code used" });
+    if (rec.members.length >= MAX_MEMBERS) return res.status(409).json({ error: "too many members" });
+    me = {
+      userId: req.userId,
+      name: String((req.body && req.body.name) || "Гость").slice(0, 40),
+      role: inv.role,
+      joinedAt: new Date().toISOString(),
+    };
+    rec.members.push(me);
+    rec.updatedAt = new Date().toISOString();
+    writeJson(sharedPath(rec.id), rec);
+    inv.used = true;
+    inv.usedBy = req.userId;
+    writeJson(codePath(code), inv);
+  }
+
+  const owner = rec.members.find((m) => m.role === "owner") || { name: "" };
+  res.json({
+    sharedId: rec.id,
+    name: rec.name,
+    currencies: rec.currencies,
+    members: publicMembers(rec),
+    ownerName: owner.name,
+    you: { userId: req.userId, name: me.name, role: me.role },
+    txs: rec.txs,
+    updatedAt: rec.updatedAt,
+  });
+});
+
+/* Список участников */
+app.get("/api/shared/wallets/:sid/members", auth, (req, res) => {
+  const rec = loadShared(req.params.sid);
+  if (!rec) return res.status(404).json({ error: "not found" });
+  if (!rec.members.some((m) => m.userId === req.userId)) return res.status(403).json({ error: "forbidden" });
+  res.json({ members: publicMembers(rec) });
+});
+
+/* Отключить участника (владелец — любого; участник — только себя) */
+app.delete("/api/shared/wallets/:sid/members/:uid", auth, (req, res) => {
+  const rec = loadShared(req.params.sid);
+  if (!rec) return res.status(404).json({ error: "not found" });
+  const target = String(req.params.uid);
+  const isOwner = rec.ownerId === req.userId;
+  if (!isOwner && target !== req.userId) return res.status(403).json({ error: "forbidden" });
+  if (target === rec.ownerId) return res.status(400).json({ error: "owner cannot be removed" });
+  rec.members = rec.members.filter((m) => m.userId !== target);
+  rec.updatedAt = new Date().toISOString();
+  writeJson(sharedPath(rec.id), rec);
+  res.json({ ok: true, members: publicMembers(rec) });
+});
+
+/* Полностью закрыть общий доступ (только владелец) */
+app.delete("/api/shared/wallets/:sid", auth, (req, res) => {
+  const rec = loadShared(req.params.sid);
+  if (!rec) return res.json({ ok: true });
+  if (rec.ownerId !== req.userId) return res.status(403).json({ error: "forbidden" });
+  try { fs.unlinkSync(sharedPath(rec.id)); } catch { /* уже нет */ }
   res.json({ ok: true });
 });
 
