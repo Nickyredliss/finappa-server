@@ -27,7 +27,7 @@ app.use((req, res, next) => {
   if (origin && ALLOWED_ORIGINS.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Methods", "GET, PUT, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, PUT, POST, PATCH, DELETE, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Finappa-Key");
   }
   if (req.method === "OPTIONS") return res.sendStatus(204);
@@ -266,6 +266,40 @@ const sanitizeTxs = (arr, author) =>
 const publicMembers = (rec) =>
   rec.members.map((m) => ({ userId: m.userId, name: m.name, role: m.role }));
 
+/* ── 5б: слияние операций ──
+   Правила: запись принадлежит автору навсегда; гость касается только своих,
+   владелец — любых. Побеждает больший updatedAt. Удаление — надгробием
+   (deleted:true), а не отсутствием в снимке: так одновременная запись двух
+   людей ничего не затирает. Старые надгробия подметаются через 90 дней. */
+const TOMBSTONE_TTL_MS = 90 * 24 * 3600 * 1000;
+
+function mergeTxs(rec, incoming, me) {
+  const isOwner = me.role === "owner";
+  const byId = new Map(rec.txs.map((t) => [t.id, t]));
+  let changed = false;
+  for (const t of incoming) {
+    if (!isOwner) t.authorId = me.userId; // гость не подпишется чужим именем
+    const cur = byId.get(t.id);
+    if (!cur) {
+      if (byId.size >= MAX_TXS) continue;
+      byId.set(t.id, t);
+      changed = true;
+    } else {
+      if (!isOwner && cur.authorId !== me.userId) continue; // чужое гость не трогает
+      if ((t.updatedAt || 0) > (cur.updatedAt || 0)) {
+        t.authorId = cur.authorId; // авторство — кто создал, оно не переписывается
+        byId.set(t.id, t);
+        changed = true;
+      }
+    }
+  }
+  const cutoff = Date.now() - TOMBSTONE_TTL_MS;
+  const next = [...byId.values()].filter((t) => !(t.deleted && (t.updatedAt || 0) < cutoff));
+  if (next.length !== rec.txs.length) changed = true;
+  if (changed) rec.txs = next;
+  return changed;
+}
+
 function newCode() {
   const b = crypto.randomBytes(8);
   let s = "";
@@ -310,7 +344,8 @@ app.post("/api/shared/wallets", auth, (req, res) => {
   res.json({ sharedId: sid, members: publicMembers(rec), you: { userId: req.userId, role: "owner" }, updatedAt: rec.updatedAt });
 });
 
-/* Синхронизация: владелец толкает снимок, участник забирает */
+/* Синхронизация: каждый пишущий участник толкает СВОИ изменения (слияние,
+   не замена), обратно все получают полный набор операций кошелька. */
 app.post("/api/shared/wallets/:sid/sync", auth, (req, res) => {
   const rec = loadShared(req.params.sid);
   if (!rec) return res.status(404).json({ error: "not found" });
@@ -328,10 +363,10 @@ app.post("/api/shared/wallets/:sid/sync", auth, (req, res) => {
       const next = body.currencies.slice(0, 12).map((c) => String(c).slice(0, 5));
       if (next.join(",") !== rec.currencies.join(",")) { rec.currencies = next; changed = true; }
     }
-    if (Array.isArray(body.txs)) { rec.txs = sanitizeTxs(body.txs, req.userId); changed = true; }
-  } else if (Array.isArray(body.txs) && body.txs.length) {
-    /* 5а: гость только смотрит. Запись откроется в 5б. */
-    return res.status(403).json({ error: "read only" });
+  }
+  if (Array.isArray(body.txs) && body.txs.length) {
+    if (me.role === "view") return res.status(403).json({ error: "read only" });
+    changed = mergeTxs(rec, sanitizeTxs(body.txs, req.userId), me) || changed;
   }
   if (changed) {
     rec.updatedAt = new Date().toISOString();
@@ -345,9 +380,27 @@ app.post("/api/shared/wallets/:sid/sync", auth, (req, res) => {
     members: publicMembers(rec),
     ownerName: owner.name,
     you: { userId: req.userId, name: me.name, role: me.role },
-    txs: me.role === "owner" ? [] : rec.txs,
+    txs: rec.txs,
     updatedAt: rec.updatedAt,
   });
+});
+
+/* Сменить право участника «смотреть» ↔ «записывать» (только владелец) */
+app.patch("/api/shared/wallets/:sid/members/:uid", auth, (req, res) => {
+  const rec = loadShared(req.params.sid);
+  if (!rec) return res.status(404).json({ error: "not found" });
+  if (rec.ownerId !== req.userId) return res.status(403).json({ error: "forbidden" });
+  const role = req.body && req.body.role;
+  if (role !== "view" && role !== "write") return res.status(400).json({ error: "bad role" });
+  const m = rec.members.find((x) => x.userId === String(req.params.uid));
+  if (!m) return res.status(404).json({ error: "no such member" });
+  if (m.role === "owner") return res.status(400).json({ error: "owner role is fixed" });
+  if (m.role !== role) {
+    m.role = role;
+    rec.updatedAt = new Date().toISOString();
+    writeJson(sharedPath(rec.id), rec);
+  }
+  res.json({ ok: true, members: publicMembers(rec) });
 });
 
 /* Выдать одноразовый код приглашения (только владелец) */
