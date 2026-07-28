@@ -37,7 +37,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "5v" }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "10" }));
 
 /* Сохранить бэкап */
 app.put("/api/backup/:key", (req, res) => {
@@ -268,26 +268,26 @@ const sanitizeTxs = (arr, author) =>
 const publicMembers = (rec) =>
   rec.members.map((m) => ({ userId: m.userId, name: m.name, role: m.role }));
 
-/* ── 5б/5в: слияние операций и подписок ──
-   Правила: запись принадлежит автору навсегда; гость касается только своих,
-   владелец — любых. Побеждает больший updatedAt. Удаление — надгробием
-   (deleted:true), а не отсутствием в снимке: так одновременная запись двух
-   людей ничего не затирает. Старые надгробия подметаются через 90 дней. */
+/* ── 5б/5в/10: слияние операций и подписок ──
+   Правила (с ТЗ-10): у общего кошелька равные права — любой участник правит
+   и удаляет любую запись. Авторство («кто внёс») закрепляется при создании и
+   больше не переписывается: подписаться чужим именем нельзя. Побеждает
+   больший updatedAt. Удаление — надгробием (deleted:true), а не отсутствием
+   в снимке: так одновременная запись двух людей ничего не затирает. Старые
+   надгробия подметаются через 90 дней. */
 const TOMBSTONE_TTL_MS = 90 * 24 * 3600 * 1000;
 
 function mergeById(list, incoming, me, max) {
-  const isOwner = me.role === "owner";
   const byId = new Map(list.map((t) => [t.id, t]));
   let changed = false;
   for (const t of incoming) {
-    if (!isOwner) t.authorId = me.userId; // гость не подпишется чужим именем
     const cur = byId.get(t.id);
     if (!cur) {
       if (byId.size >= max) continue;
+      t.authorId = me.userId; // новой записи автор — тот, кто её принёс
       byId.set(t.id, t);
       changed = true;
     } else {
-      if (!isOwner && cur.authorId !== me.userId) continue; // чужое гость не трогает
       if ((t.updatedAt || 0) > (cur.updatedAt || 0)) {
         t.authorId = cur.authorId; // авторство — кто создал, оно не переписывается
         byId.set(t.id, t);
@@ -313,8 +313,9 @@ function mergeSubs(rec, incoming, me) {
   return r.changed;
 }
 
-/* 5в: подписка общего кошелька. Категория денормализована, как у операций.
-   lastHandled не путешествует — обрабатывает списание только автор. */
+/* 5в/10: подписка общего кошелька. Категория денормализована, как у операций.
+   С ТЗ-10 lastHandled путешествует: права равные, отметку «уже списано» видят
+   оба участника — иначе одну и ту же подписку внесут дважды. */
 function sanitizeSub(s, fallbackAuthor) {
   if (!s || typeof s.id !== "string" || !s.id || s.id.length > 40) return null;
   return {
@@ -327,6 +328,7 @@ function sanitizeSub(s, fallbackAuthor) {
     month: s.periodicity === "yearly" ? Math.min(12, Math.max(1, Number(s.month) || 1)) : undefined,
     catName: String(s.catName || "").slice(0, 40),
     catEmoji: String(s.catEmoji || "").slice(0, 8),
+    lastHandled: typeof s.lastHandled === "string" && s.lastHandled.length <= 12 ? s.lastHandled : null,
     authorId: typeof s.authorId === "string" && s.authorId.length <= 32 ? s.authorId : fallbackAuthor,
     updatedAt: Number(s.updatedAt) || Date.now(),
     deleted: !!s.deleted,
@@ -380,8 +382,9 @@ app.post("/api/shared/wallets", auth, (req, res) => {
   res.json({ sharedId: sid, members: publicMembers(rec), you: { userId: req.userId, role: "owner" }, updatedAt: rec.updatedAt });
 });
 
-/* Синхронизация: каждый пишущий участник толкает СВОИ изменения (слияние,
-   не замена), обратно все получают полный набор операций кошелька. */
+/* Синхронизация: каждый участник толкает свои изменения (слияние, не замена),
+   обратно все получают полный набор операций кошелька. С ТЗ-10 права равные:
+   роли «только просмотр» больше нет, писать может любой участник. */
 app.post("/api/shared/wallets/:sid/sync", auth, (req, res) => {
   const rec = loadShared(req.params.sid);
   if (!rec) return res.status(404).json({ error: "not found" });
@@ -390,6 +393,8 @@ app.post("/api/shared/wallets/:sid/sync", auth, (req, res) => {
 
   const body = req.body || {};
   let changed = false;
+  /* 10: старые участники с ролью «view» тихо повышаются до «write» */
+  if (me.role === "view") { me.role = "write"; changed = true; }
   if (me.role === "owner") {
     if (typeof body.name === "string" && body.name.trim() && body.name.trim() !== rec.name) {
       rec.name = body.name.trim().slice(0, 60);
@@ -401,11 +406,9 @@ app.post("/api/shared/wallets/:sid/sync", auth, (req, res) => {
     }
   }
   if (Array.isArray(body.txs) && body.txs.length) {
-    if (me.role === "view") return res.status(403).json({ error: "read only" });
     changed = mergeTxs(rec, sanitizeTxs(body.txs, req.userId), me) || changed;
   }
   if (Array.isArray(body.subs) && body.subs.length) {
-    if (me.role === "view") return res.status(403).json({ error: "read only" });
     changed = mergeSubs(rec, sanitizeSubs(body.subs, req.userId), me) || changed;
   }
   if (changed) {
@@ -426,13 +429,15 @@ app.post("/api/shared/wallets/:sid/sync", auth, (req, res) => {
   });
 });
 
-/* Сменить право участника «смотреть» ↔ «записывать» (только владелец) */
+/* 10: роли «просмотр» больше нет. Ручка оставлена для старых клиентов —
+   понижение до «view» она молча превращает в «write». */
 app.patch("/api/shared/wallets/:sid/members/:uid", auth, (req, res) => {
   const rec = loadShared(req.params.sid);
   if (!rec) return res.status(404).json({ error: "not found" });
   if (rec.ownerId !== req.userId) return res.status(403).json({ error: "forbidden" });
-  const role = req.body && req.body.role;
-  if (role !== "view" && role !== "write") return res.status(400).json({ error: "bad role" });
+  const asked = req.body && req.body.role;
+  if (asked !== "view" && asked !== "write") return res.status(400).json({ error: "bad role" });
+  const role = "write";
   const m = rec.members.find((x) => x.userId === String(req.params.uid));
   if (!m) return res.status(404).json({ error: "no such member" });
   if (m.role === "owner") return res.status(400).json({ error: "owner role is fixed" });
@@ -451,7 +456,7 @@ app.post("/api/shared/wallets/:sid/invites", auth, (req, res) => {
   if (rec.ownerId !== req.userId) return res.status(403).json({ error: "forbidden" });
   if (rec.members.length >= MAX_MEMBERS) return res.status(409).json({ error: "too many members" });
   sweepInvites();
-  const role = req.body && req.body.role === "write" ? "write" : "view";
+  const role = "write"; // 10: приглашённый сразу пишет, роли «просмотр» больше нет
   const code = newCode();
   const expiresAt = Date.now() + INVITE_TTL_MS;
   writeJson(codePath(code), { code, sharedId: rec.id, role, createdBy: req.userId, expiresAt, used: false });
