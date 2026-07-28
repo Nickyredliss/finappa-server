@@ -37,7 +37,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server" }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "5v" }));
 
 /* Сохранить бэкап */
 app.put("/api/backup/:key", (req, res) => {
@@ -161,6 +161,7 @@ async function checkSubscriptionsAndNotify(force) {
     let changed = false;
     for (const s of subs) {
       if (!s || !s.id || !s.day || !s.amount) continue;
+      if (s.shared) continue; // чужая подписка из общего кошелька — напоминаем только автору
       const charge = nextChargeDate(Number(s.day), today);
       if (charge.getTime() !== tomorrow.getTime()) continue;
       const periodKey = `${charge.getFullYear()}-${String(charge.getMonth() + 1).padStart(2, "0")}`;
@@ -206,6 +207,7 @@ fs.mkdirSync(INVITE_DIR, { recursive: true });
 const SID_RE = /^sw-[a-f0-9]{16}$/;
 const MAX_MEMBERS = 5;
 const MAX_TXS = 20000;
+const MAX_SUBS = 500;
 const INVITE_TTL_MS = 48 * 3600 * 1000;
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // без похожих I,O,0,1
 
@@ -266,22 +268,22 @@ const sanitizeTxs = (arr, author) =>
 const publicMembers = (rec) =>
   rec.members.map((m) => ({ userId: m.userId, name: m.name, role: m.role }));
 
-/* ── 5б: слияние операций ──
+/* ── 5б/5в: слияние операций и подписок ──
    Правила: запись принадлежит автору навсегда; гость касается только своих,
    владелец — любых. Побеждает больший updatedAt. Удаление — надгробием
    (deleted:true), а не отсутствием в снимке: так одновременная запись двух
    людей ничего не затирает. Старые надгробия подметаются через 90 дней. */
 const TOMBSTONE_TTL_MS = 90 * 24 * 3600 * 1000;
 
-function mergeTxs(rec, incoming, me) {
+function mergeById(list, incoming, me, max) {
   const isOwner = me.role === "owner";
-  const byId = new Map(rec.txs.map((t) => [t.id, t]));
+  const byId = new Map(list.map((t) => [t.id, t]));
   let changed = false;
   for (const t of incoming) {
     if (!isOwner) t.authorId = me.userId; // гость не подпишется чужим именем
     const cur = byId.get(t.id);
     if (!cur) {
-      if (byId.size >= MAX_TXS) continue;
+      if (byId.size >= max) continue;
       byId.set(t.id, t);
       changed = true;
     } else {
@@ -295,10 +297,44 @@ function mergeTxs(rec, incoming, me) {
   }
   const cutoff = Date.now() - TOMBSTONE_TTL_MS;
   const next = [...byId.values()].filter((t) => !(t.deleted && (t.updatedAt || 0) < cutoff));
-  if (next.length !== rec.txs.length) changed = true;
-  if (changed) rec.txs = next;
-  return changed;
+  if (next.length !== list.length) changed = true;
+  return { next, changed };
 }
+
+function mergeTxs(rec, incoming, me) {
+  const r = mergeById(rec.txs, incoming, me, MAX_TXS);
+  if (r.changed) rec.txs = r.next;
+  return r.changed;
+}
+
+function mergeSubs(rec, incoming, me) {
+  const r = mergeById(rec.subs || [], incoming, me, MAX_SUBS);
+  if (r.changed) rec.subs = r.next;
+  return r.changed;
+}
+
+/* 5в: подписка общего кошелька. Категория денормализована, как у операций.
+   lastHandled не путешествует — обрабатывает списание только автор. */
+function sanitizeSub(s, fallbackAuthor) {
+  if (!s || typeof s.id !== "string" || !s.id || s.id.length > 40) return null;
+  return {
+    id: s.id,
+    name: String(s.name || "").slice(0, 60),
+    amount: Number(s.amount) || 0,
+    currency: String(s.currency || "").slice(0, 5),
+    day: Math.min(31, Math.max(1, Number(s.day) || 1)),
+    periodicity: s.periodicity === "yearly" ? "yearly" : "monthly",
+    month: s.periodicity === "yearly" ? Math.min(12, Math.max(1, Number(s.month) || 1)) : undefined,
+    catName: String(s.catName || "").slice(0, 40),
+    catEmoji: String(s.catEmoji || "").slice(0, 8),
+    authorId: typeof s.authorId === "string" && s.authorId.length <= 32 ? s.authorId : fallbackAuthor,
+    updatedAt: Number(s.updatedAt) || Date.now(),
+    deleted: !!s.deleted,
+  };
+}
+
+const sanitizeSubs = (arr, author) =>
+  (Array.isArray(arr) ? arr : []).slice(0, MAX_SUBS).map((s) => sanitizeSub(s, author)).filter(Boolean);
 
 function newCode() {
   const b = crypto.randomBytes(8);
@@ -368,6 +404,10 @@ app.post("/api/shared/wallets/:sid/sync", auth, (req, res) => {
     if (me.role === "view") return res.status(403).json({ error: "read only" });
     changed = mergeTxs(rec, sanitizeTxs(body.txs, req.userId), me) || changed;
   }
+  if (Array.isArray(body.subs) && body.subs.length) {
+    if (me.role === "view") return res.status(403).json({ error: "read only" });
+    changed = mergeSubs(rec, sanitizeSubs(body.subs, req.userId), me) || changed;
+  }
   if (changed) {
     rec.updatedAt = new Date().toISOString();
     writeJson(sharedPath(rec.id), rec);
@@ -381,6 +421,7 @@ app.post("/api/shared/wallets/:sid/sync", auth, (req, res) => {
     ownerName: owner.name,
     you: { userId: req.userId, name: me.name, role: me.role },
     txs: rec.txs,
+    subs: rec.subs || [],
     updatedAt: rec.updatedAt,
   });
 });
@@ -464,6 +505,7 @@ app.post("/api/shared/invites/:code/accept", auth, (req, res) => {
     ownerName: owner.name,
     you: { userId: req.userId, name: me.name, role: me.role },
     txs: rec.txs,
+    subs: rec.subs || [],
     updatedAt: rec.updatedAt,
   });
 });
