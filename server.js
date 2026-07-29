@@ -20,6 +20,8 @@ const ALLOWED_ORIGINS = new Set([
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 app.use(express.json({ limit: MAX_BYTES }));
+/* Быстрая команда с iPhone шлёт текст как text/plain — разбираем и его */
+app.use(express.text({ type: ["text/plain", "text/*"], limit: 16 * 1024 }));
 
 /* CORS */
 app.use((req, res, next) => {
@@ -37,7 +39,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "10" }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "11" }));
 
 /* Сохранить бэкап */
 app.put("/api/backup/:key", (req, res) => {
@@ -545,5 +547,89 @@ app.delete("/api/shared/wallets/:sid", auth, (req, res) => {
   try { fs.unlinkSync(sharedPath(rec.id)); } catch { /* уже нет */ }
   res.json({ ok: true });
 });
+
+/* ───────────────────────── Инбокс черновиков (ТЗ-13) ─────────────────────────
+   Черновик — просто текст, который приехал снаружи (Быстрая команда, автоматизация
+   на входящее SMS). Приложение забирает их и подтверждает приём, после чего
+   сервер их не хранит: инбокс — почтовый ящик, а не хранилище.
+   Отправка идёт по отдельному токену, НЕ по ключу устройства: токен попадает
+   в Быструю команду на телефоне, и утечка токена даёт только право прислать
+   черновик, но не читать бэкап. */
+
+const INBOX_DIR = path.join(DATA_DIR, "inbox");
+fs.mkdirSync(INBOX_DIR, { recursive: true });
+
+const MAX_INBOX = 200;          // ящик не растёт бесконечно: старое вытесняется
+const MAX_DRAFT_LEN = 500;
+const TOKEN_RE = /^[a-z0-9]{12}$/;
+const inboxPath = (uid) => path.join(INBOX_DIR, uid + ".json");
+const TOKENS_PATH = path.join(INBOX_DIR, "_tokens.json");
+
+const newToken = () => {
+  const abc = "abcdefghijkmnpqrstuvwxyz23456789"; // без похожих l,o,0,1
+  let out = "";
+  const buf = crypto.randomBytes(12);
+  for (let i = 0; i < 12; i++) out += abc[buf[i] % abc.length];
+  return out;
+};
+
+/* userId → токен; обратная карта токен → userId лежит рядом одним файлом */
+function inboxToken(userId) {
+  const map = readJson(TOKENS_PATH, {});
+  for (const t of Object.keys(map)) if (map[t] === userId) return t;
+  let t = newToken();
+  while (map[t]) t = newToken();
+  map[t] = userId;
+  writeJson(TOKENS_PATH, map);
+  return t;
+}
+
+const readInbox = (uid) => {
+  const r = readJson(inboxPath(uid), null);
+  return r && Array.isArray(r.items) ? r.items : [];
+};
+
+/* Забрать черновики (и заодно узнать свой токен) */
+app.get("/api/inbox", auth, (req, res) => {
+  res.json({ token: inboxToken(req.userId), items: readInbox(req.userId) });
+});
+
+/* Подтвердить приём: что забрали — сервер удаляет */
+app.post("/api/inbox/ack", auth, (req, res) => {
+  const ids = Array.isArray(req.body && req.body.ids) ? req.body.ids.map(String) : [];
+  const left = readInbox(req.userId).filter((it) => !ids.includes(it.id));
+  writeJson(inboxPath(req.userId), { items: left });
+  res.json({ ok: true, left: left.length });
+});
+
+/* Положить черновик по токену. Без авторизации — токен и есть пропуск.
+   GET поддержан нарочно: в «Быстрых командах» это самый короткий путь. */
+function pushDraft(req, res) {
+  const token = String(req.params.token || "");
+  if (!TOKEN_RE.test(token)) return res.status(400).json({ error: "bad token" });
+  const map = readJson(TOKENS_PATH, {});
+  const uid = map[token];
+  if (!uid) return res.status(404).json({ error: "unknown token" });
+
+  const raw =
+    (req.query && req.query.text) ||
+    (typeof req.body === "string" ? req.body : req.body && (req.body.text || req.body.body)) ||
+    "";
+  const text = String(raw).replace(/\s+/g, " ").trim().slice(0, MAX_DRAFT_LEN);
+  if (!text) return res.status(400).json({ error: "empty text" });
+
+  const items = readInbox(uid);
+  items.push({
+    id: crypto.randomBytes(8).toString("hex"),
+    text,
+    at: new Date().toISOString(),
+    source: String((req.query && req.query.source) || (req.body && req.body.source) || "shortcut").slice(0, 20),
+  });
+  writeJson(inboxPath(uid), { items: items.slice(-MAX_INBOX) });
+  res.json({ ok: true, queued: Math.min(items.length, MAX_INBOX) });
+}
+
+app.post("/api/inbox/t/:token", pushDraft);
+app.get("/api/inbox/t/:token", pushDraft);
 
 app.listen(PORT, () => console.log(`finappa-server on :${PORT}, data in ${DATA_DIR}`));
