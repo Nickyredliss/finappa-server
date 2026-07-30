@@ -20,8 +20,12 @@ const ALLOWED_ORIGINS = new Set([
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 app.use(express.json({ limit: MAX_BYTES }));
-/* Быстрая команда с iPhone шлёт текст как text/plain — разбираем и его */
+/* Быстрая команда с iPhone шлёт тело по-разному в зависимости от версии iOS:
+   «Текст» → text/plain, «Форма» → x-www-form-urlencoded, «Файл» → octet-stream.
+   Принимаем все три: пусть настройка на телефоне будет какой угодно. */
 app.use(express.text({ type: ["text/plain", "text/*"], limit: 16 * 1024 }));
+app.use(express.urlencoded({ extended: false, limit: 16 * 1024 }));
+app.use(express.raw({ type: ["application/octet-stream"], limit: 16 * 1024 }));
 
 /* CORS */
 app.use((req, res, next) => {
@@ -39,7 +43,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "11" }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "12" }));
 
 /* Сохранить бэкап */
 app.put("/api/backup/:key", (req, res) => {
@@ -611,9 +615,10 @@ function pushDraft(req, res) {
   const uid = map[token];
   if (!uid) return res.status(404).json({ error: "unknown token" });
 
+  const b = req.body;
   const raw =
     (req.query && req.query.text) ||
-    (typeof req.body === "string" ? req.body : req.body && (req.body.text || req.body.body)) ||
+    (typeof b === "string" ? b : Buffer.isBuffer(b) ? b.toString("utf8") : b && (b.text || b.body)) ||
     "";
   const text = String(raw).replace(/\s+/g, " ").trim().slice(0, MAX_DRAFT_LEN);
   if (!text) return res.status(400).json({ error: "empty text" });
