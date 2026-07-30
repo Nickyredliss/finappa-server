@@ -43,7 +43,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "13" }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "14" }));
 
 /* Сохранить бэкап */
 app.put("/api/backup/:key", (req, res) => {
@@ -650,5 +650,205 @@ function pushDraft(req, res) {
 
 app.post("/api/inbox/t/:token", pushDraft);
 app.get("/api/inbox/t/:token", pushDraft);
+
+/* ─────────────── ТЗ-15: живая синхронизация личных данных ───────────────
+   Задача не «работать с двух экранов», а «не потерять всё при смене телефона».
+   Поэтому сервер тут — тупое место встречи, а не источник правды: он хранит
+   слитое состояние и отдаёт его назад. Правила слияния ровно те же, что у
+   общих кошельков (ТЗ-5б/10): у каждой записи есть updatedAt, побеждает
+   больший; удаление живёт надгробием, а не отсутствием записи в снимке —
+   иначе устройство, которое отстало на неделю, воскресит всё удалённое.
+
+   Полей записей сервер НЕ разбирает: данные принадлежат одному человеку,
+   валидировать тут нечего, а любая «санитизация» рискует срезать поле,
+   про которое сервер ещё не знает (валюты кошелька, флаги операции).
+   Ограничиваем только размер и количество. */
+
+const PERSONAL_DIR = path.join(DATA_DIR, "personal");
+fs.mkdirSync(PERSONAL_DIR, { recursive: true });
+
+const personalPath = (uid) => path.join(PERSONAL_DIR, uid + ".json");
+
+/* Коллекции и потолки. Потолок — защита от заливки мусора, не от пользователя:
+   50k операций это ~30 лет по 5 записей в день. */
+const P_COLLS = {
+  wallets: 200,
+  categories: 500,
+  txs: 50000,
+  subscriptions: 500,
+  drafts: 500,
+};
+const MAX_PTOMB = 20000;
+const MAX_PERSONAL_BYTES = 4 * 1024 * 1024;
+
+const emptyPersonal = () => ({
+  wallets: [], categories: [], txs: [], subscriptions: [], drafts: [],
+  settings: { updatedAt: 0 },
+  pTomb: [],
+  rev: 0,
+});
+
+const pNum = (v) => Number(v) || 0;
+
+/* Слияние одной коллекции по id: побеждает больший updatedAt. */
+function mergePColl(local, incoming, max) {
+  const byId = new Map();
+  for (const it of local) if (it && typeof it.id === "string") byId.set(it.id, it);
+  for (const it of incoming) {
+    if (!it || typeof it.id !== "string" || !it.id || it.id.length > 64) continue;
+    const cur = byId.get(it.id);
+    if (!cur) {
+      if (byId.size >= max) continue;
+      byId.set(it.id, it);
+    } else if (pNum(it.updatedAt) > pNum(cur.updatedAt)) {
+      byId.set(it.id, it);
+    }
+  }
+  return [...byId.values()];
+}
+
+/* Слияние надгробий: по паре coll+id, побеждает более позднее. */
+function mergePTomb(local, incoming) {
+  const byKey = new Map();
+  const put = (t) => {
+    if (!t || typeof t.id !== "string" || !t.id || !P_COLLS[t.coll]) return;
+    const k = t.coll + "|" + t.id;
+    const cur = byKey.get(k);
+    const rec = { coll: t.coll, id: t.id, updatedAt: pNum(t.updatedAt) };
+    if (!cur || rec.updatedAt > cur.updatedAt) byKey.set(k, rec);
+  };
+  for (const t of local) put(t);
+  for (const t of incoming) put(t);
+  const cutoff = Date.now() - TOMBSTONE_TTL_MS;
+  return [...byKey.values()].filter((t) => t.updatedAt >= cutoff).slice(-MAX_PTOMB);
+}
+
+/* Надгробие убивает запись только если запись не новее его: правка после
+   удаления возвращает запись к жизни, и это правильный порядок событий. */
+function applyPTomb(state) {
+  for (const t of state.pTomb) {
+    const coll = state[t.coll];
+    if (!Array.isArray(coll)) continue;
+    const i = coll.findIndex((x) => x && x.id === t.id);
+    if (i >= 0 && pNum(coll[i].updatedAt) <= t.updatedAt) coll.splice(i, 1);
+  }
+}
+
+/* Настройки (активный кошелёк, имя, последние подставленные значения) —
+   один объект целиком, побеждает более свежий: разбирать их по полям смысла
+   нет, а конфликт тут безобиден. */
+function mergePSettings(local, incoming) {
+  const l = local && typeof local === "object" ? local : { updatedAt: 0 };
+  const r = incoming && typeof incoming === "object" ? incoming : null;
+  if (!r) return l;
+  return pNum(r.updatedAt) > pNum(l.updatedAt) ? r : l;
+}
+
+function mergePersonal(state, incoming) {
+  for (const coll of Object.keys(P_COLLS)) {
+    state[coll] = mergePColl(
+      Array.isArray(state[coll]) ? state[coll] : [],
+      Array.isArray(incoming[coll]) ? incoming[coll] : [],
+      P_COLLS[coll]
+    );
+  }
+  state.pTomb = mergePTomb(
+    Array.isArray(state.pTomb) ? state.pTomb : [],
+    Array.isArray(incoming.pTomb) ? incoming.pTomb : []
+  );
+  state.settings = mergePSettings(state.settings, incoming.settings);
+  applyPTomb(state);
+  return state;
+}
+
+const readPersonal = (uid) => {
+  const r = readJson(personalPath(uid), null);
+  if (!r || typeof r !== "object") return emptyPersonal();
+  const base = emptyPersonal();
+  for (const k of Object.keys(base)) if (r[k] !== undefined) base[k] = r[k];
+  return base;
+};
+
+/* Обмен состоянием. Клиент шлёт своё, получает слитое — и применяет его
+   у себя тем же кодом. Сходимость достигается за один такт в обе стороны. */
+app.post("/api/personal/sync", auth, (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  let bytes = 0;
+  try { bytes = Buffer.byteLength(JSON.stringify(body)); } catch { bytes = 0; }
+  if (bytes > MAX_PERSONAL_BYTES) return res.status(413).json({ error: "too large" });
+
+  const state = readPersonal(req.userId);
+  const before = JSON.stringify(state);
+  mergePersonal(state, body);
+  const after = JSON.stringify(state);
+  if (after !== before) {
+    state.rev = pNum(state.rev) + 1;
+    writeJson(personalPath(req.userId), state);
+  }
+  res.json({ ok: true, state, rev: state.rev });
+});
+
+/* Забрать состояние без отправки своего — новое устройство при подключении. */
+app.get("/api/personal/sync", auth, (req, res) => {
+  const state = readPersonal(req.userId);
+  res.json({ ok: true, state, rev: pNum(state.rev) });
+});
+
+/* ── Смена кода восстановления ──
+   Раньше код открывал только снимок; с живой синхронизацией он открывает
+   актуальные данные, поэтому сменить его должно быть возможно, а утёкший —
+   отозвать. Переезжает всё, что привязано к ключу: бэкап, личное состояние,
+   ящик черновиков, push-подписка и членство в общих кошельках.
+   Токен инбокса намеренно НЕ переезжает: смена кода — действие по безопасности,
+   старый токен должен перестать работать. Новый выдаётся при первом же
+   обращении к /api/inbox, Быструю команду на телефоне нужно обновить. */
+app.post("/api/account/rotate", auth, (req, res) => {
+  const oldKey = String(req.headers["x-finappa-key"] || "");
+  const newKey = String((req.body && req.body.newKey) || "");
+  if (!KEY_RE.test(newKey)) return res.status(400).json({ error: "bad new key" });
+  if (newKey === oldKey) return res.status(400).json({ error: "same key" });
+
+  const oldUid = req.userId;
+  const newUid = userIdOf(newKey);
+  if (fs.existsSync(keyPath(newKey)) || fs.existsSync(personalPath(newUid))) {
+    return res.status(409).json({ error: "key taken" });
+  }
+
+  /* Сначала общие кошельки: операция идемпотентна, повтор безопасен. */
+  const sids = Array.isArray(req.body && req.body.sids) ? req.body.sids.slice(0, 50) : [];
+  let sharedMoved = 0;
+  for (const sid of sids) {
+    const rec = loadShared(sid);
+    if (!rec || !Array.isArray(rec.members)) continue;
+    const me = rec.members.find((m) => m.userId === oldUid);
+    if (!me) continue;
+    if (rec.members.some((m) => m.userId === newUid)) continue;
+    me.userId = newUid;
+    for (const t of rec.txs || []) if (t.authorId === oldUid) t.authorId = newUid;
+    for (const t of rec.subs || []) if (t.authorId === oldUid) t.authorId = newUid;
+    writeJson(sharedPath(sid), rec);
+    sharedMoved++;
+  }
+
+  const move = (from, to) => {
+    try { if (fs.existsSync(from) && !fs.existsSync(to)) { fs.renameSync(from, to); return true; } } catch {}
+    return false;
+  };
+  const moved = {
+    backup: move(keyPath(oldKey), keyPath(newKey)),
+    personal: move(personalPath(oldUid), personalPath(newUid)),
+    inbox: move(inboxPath(oldUid), inboxPath(newUid)),
+    push: move(pushPath(oldKey), pushPath(newKey)),
+    shared: sharedMoved,
+  };
+
+  /* Отзыв старого токена инбокса */
+  const map = readJson(TOKENS_PATH, {});
+  let dropped = 0;
+  for (const t of Object.keys(map)) if (map[t] === oldUid) { delete map[t]; dropped++; }
+  if (dropped) writeJson(TOKENS_PATH, map);
+
+  res.json({ ok: true, moved, inboxTokenRevoked: dropped > 0 });
+});
 
 app.listen(PORT, () => console.log(`finappa-server on :${PORT}, data in ${DATA_DIR}`));
