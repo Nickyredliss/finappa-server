@@ -43,7 +43,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "12" }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "13" }));
 
 /* Сохранить бэкап */
 app.put("/api/backup/:key", (req, res) => {
@@ -616,9 +616,23 @@ function pushDraft(req, res) {
   if (!uid) return res.status(404).json({ error: "unknown token" });
 
   const b = req.body;
+  /* Имя поля формы задаёт человек на телефоне и легко набирается кириллицей
+     («текст» вместо `text`) — поэтому берём text/body, а если их нет, первое
+     непустое строковое значение объекта. Настройка на телефоне не должна
+     требовать точности. */
+  const fromObject = (o) => {
+    if (!o || typeof o !== "object") return "";
+    if (typeof o.text === "string" && o.text.trim()) return o.text;
+    if (typeof o.body === "string" && o.body.trim()) return o.body;
+    for (const k of Object.keys(o)) {
+      const v = o[k];
+      if (typeof v === "string" && v.trim()) return v;
+    }
+    return "";
+  };
   const raw =
     (req.query && req.query.text) ||
-    (typeof b === "string" ? b : Buffer.isBuffer(b) ? b.toString("utf8") : b && (b.text || b.body)) ||
+    (typeof b === "string" ? b : Buffer.isBuffer(b) ? b.toString("utf8") : fromObject(b)) ||
     "";
   const text = String(raw).replace(/\s+/g, " ").trim().slice(0, MAX_DRAFT_LEN);
   if (!text) return res.status(400).json({ error: "empty text" });
