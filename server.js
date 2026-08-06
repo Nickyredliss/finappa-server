@@ -43,7 +43,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "14" }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "15" }));
 
 /* Сохранить бэкап */
 app.put("/api/backup/:key", (req, res) => {
@@ -677,12 +677,13 @@ const P_COLLS = {
   txs: 50000,
   subscriptions: 500,
   drafts: 500,
+  goals: 500,
 };
 const MAX_PTOMB = 20000;
 const MAX_PERSONAL_BYTES = 4 * 1024 * 1024;
 
 const emptyPersonal = () => ({
-  wallets: [], categories: [], txs: [], subscriptions: [], drafts: [],
+  wallets: [], categories: [], txs: [], subscriptions: [], drafts: [], goals: [],
   settings: { updatedAt: 0 },
   pTomb: [],
   rev: 0,
