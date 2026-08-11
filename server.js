@@ -44,7 +44,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "17" }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "18" }));
 
 /* ── ТЗ-18: курсы валют ──────────────────────────────────────────────────
    Клиент в третьи руки не ходит: провайдеры режут CORS и просят ключей, а
@@ -945,6 +945,118 @@ app.post("/api/account/rotate", auth, (req, res) => {
   if (dropped) writeJson(TOKENS_PATH, map);
 
   res.json({ ok: true, moved, inboxTokenRevoked: dropped > 0 });
+});
+
+
+/* ───────────────── ТЗ-21: напоминание о неразобранных черновиках ─────────────────
+   Nicky: «забываю зайти и проверить черновики, а когда захожу — не знаю, за что
+   был перевод». Вторая жалоба на самом деле про время: банк получателя не
+   называет вовсе, и вспомнить можно только пока свежо. Значит лечение — не
+   подсказка задним числом, а частое напоминание с суммой.
+
+   Черновик живёт в двух местах, и считаются оба:
+   - в инбоксе, если приложение не открывали с момента прихода сообщения (это и
+     есть основной случай «забыл зайти»);
+   - в личном снимке, если приложение открывали, а черновик не разобрали.
+
+   Ночью молчим, и через сутки безуспешных напоминаний частота падает до раза в
+   день: забытый на выходные черновик не должен превратиться в полсотни пушей. */
+
+const DRAFT_QUIET_FROM = 23;    // с 23:00 по Бангкоку тихо
+const DRAFT_QUIET_TO = 8;       // до 8:00
+const DRAFT_HOURLY_LIMIT = 12;  // после стольких напоминаний — раз в сутки
+const DRAFT_MIN_GAP_MS = 55 * 60 * 1000;  // «раз в час» с запасом на дрожь таймера
+const DAY_MS = 24 * 3600 * 1000;
+
+/* Сумма для текста уведомления — и только для него. Настоящий разбор живёт в
+   клиенте и остаётся единственным источником правды; ошибка здесь ничего не
+   портит, потому что запись всё равно создаётся руками на открытом экране.
+   Поэтому тут не второй парсер, а нюхач: число рядом со словом валюты. */
+function sniffAmount(text) {
+  const s = String(text || "").replace(/\s+/g, " ");
+  let m = s.match(/\b(?:amount|Purchase)\s+([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:Baht|THB|B\.)/i);
+  if (!m) m = s.match(/([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:Baht|THB|бат)/i);
+  if (!m) return "";
+  const n = Number(String(m[1]).replace(/,/g, ""));
+  if (!isFinite(n) || n <= 0) return "";
+  return n.toLocaleString("ru-RU", { maximumFractionDigits: 2 }) + " THB";
+}
+
+function draftMessage(texts) {
+  const sums = texts.map(sniffAmount).filter(Boolean);
+  if (texts.length === 1) {
+    return {
+      title: "📥 Черновик ждёт",
+      body: (sums[0] ? sums[0] + " — р" : "Р") + "азберите, пока помните, за что это было",
+    };
+  }
+  const head = sums.slice(0, 3).join(" · ");
+  return {
+    title: `📥 Черновиков: ${texts.length}`,
+    body: head ? head + (sums.length > 3 ? " и другие" : "") : "Откройте Finappa, чтобы разобрать",
+  };
+}
+
+/* force — не смотреть на ночь и на паузу между напоминаниями;
+   dry — ничего не слать и ничего не записывать, только показать план.
+   Оба нужны для проверки: без них поведение можно увидеть только подождав час. */
+async function remindDrafts(opts) {
+  const o = opts || {};
+  const { hour } = bangkokNow();
+  const quiet = hour >= DRAFT_QUIET_FROM || hour < DRAFT_QUIET_TO;
+  const report = { hour, quiet, planned: [] };
+  if (quiet && !o.force) return report;
+
+  const files = fs.readdirSync(PUSH_DIR).filter((f) => f.endsWith(".json"));
+  for (const f of files) {
+    const key = f.replace(/\.json$/, "");
+    const rec = readJson(pushPath(key), null);
+    if (!rec || !rec.subscription) continue;
+
+    const uid = userIdOf(key);
+    const personal = readJson(personalPath(uid), null);
+    const kept = personal && Array.isArray(personal.drafts) ? personal.drafts : [];
+    const texts = readInbox(uid).map((i) => i && i.text)
+      .concat(kept.map((d) => d && d.text))
+      .filter(Boolean);
+
+    const st = rec.draftReminder || {};
+    if (!texts.length) {
+      /* Разобрал — счётчик обнуляется, следующий черновик начнёт с нуля. */
+      if (!o.dry && st.count) { rec.draftReminder = {}; writeJson(pushPath(key), rec); }
+      continue;
+    }
+
+    const now = Date.now();
+    const gap = (st.count || 0) >= DRAFT_HOURLY_LIMIT ? DAY_MS : DRAFT_MIN_GAP_MS;
+    if (!o.force && st.lastAt && now - st.lastAt < gap) continue;
+
+    const msg = draftMessage(texts);
+    report.planned.push({ key: key.slice(0, 6), n: texts.length, title: msg.title, body: msg.body });
+    if (o.dry) continue;
+
+    try {
+      await webpush.sendNotification(rec.subscription, JSON.stringify(msg));
+      rec.draftReminder = { count: (st.count || 0) + 1, lastAt: now };
+      writeJson(pushPath(key), rec);
+      console.log(`draft push: ${key.slice(0, 8)}… n=${texts.length}`);
+    } catch (e) {
+      console.error("draft push error", e && e.statusCode);
+      if (e && (e.statusCode === 404 || e.statusCode === 410)) {
+        delete rec.subscription;
+        writeJson(pushPath(key), rec);
+      }
+    }
+  }
+  return report;
+}
+
+setInterval(() => remindDrafts().catch(() => {}), 60 * 60 * 1000);
+
+/* Ручной прогон — им же проверяется поведение в тестах. */
+app.post("/api/push/drafts-check", async (req, res) => {
+  const b = req.body || {};
+  res.json(await remindDrafts({ force: !!b.force, dry: !!b.dry }));
 });
 
 app.listen(PORT, () => console.log(`finappa-server on :${PORT}, data in ${DATA_DIR}`));
