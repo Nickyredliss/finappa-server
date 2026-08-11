@@ -6,6 +6,7 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const webpush = require("web-push");
+const https = require("https");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -43,7 +44,91 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "15" }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "16" }));
+
+/* ── ТЗ-18: курсы валют ──────────────────────────────────────────────────
+   Клиент в третьи руки не ходит: провайдеры режут CORS и просят ключей, а
+   кэш на сервере один на все устройства. Курс отдаём актуальный — в Сводке
+   конвертация это линза, а не запись, поэтому хранить его в записях не надо
+   и «правильного курса на дату» здесь не существует.
+
+   Берём https напрямую, а не global fetch: сервер должен работать на любой
+   версии Node, а не только на 18+. */
+
+const RATES_PATH = path.join(DATA_DIR, "rates.json");
+const RATES_TTL_MS = 60 * 60 * 1000;
+const RATES_BASE = "USD";
+
+const readRates = () => {
+  try { return JSON.parse(fs.readFileSync(RATES_PATH, "utf8")); } catch (e) { return null; }
+};
+const writeRates = (v) => {
+  try { fs.writeFileSync(RATES_PATH, JSON.stringify(v)); } catch (e) {}
+};
+
+const httpsJson = (url) =>
+  new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const req = https.get(url, { timeout: 8000, headers: { "User-Agent": "finappa" } }, (r) => {
+        if (r.statusCode !== 200) { r.resume(); return finish(null); }
+        let body = "";
+        r.setEncoding("utf8");
+        r.on("data", (c) => { body += c; if (body.length > 400000) req.destroy(); });
+        r.on("end", () => { try { finish(JSON.parse(body)); } catch (e) { finish(null); } });
+        r.on("error", () => finish(null));
+      });
+      req.on("timeout", () => req.destroy());
+      req.on("error", () => finish(null));
+    } catch (e) { finish(null); }
+  });
+
+/* Два источника без ключа. Первый знает рубль, второй — запасной на случай,
+   когда первый лежит. Проверяем ответ по наличию THB: пустой или урезанный
+   ответ хуже отсутствия ответа, потому что молча испортит все цифры. */
+const pullRates = async () => {
+  const a = await httpsJson("https://open.er-api.com/v6/latest/" + RATES_BASE);
+  if (a && a.rates && Number(a.rates.THB) > 0) {
+    return { base: RATES_BASE, rates: a.rates, source: "er-api" };
+  }
+  const b = await httpsJson("https://api.frankfurter.app/latest?from=" + RATES_BASE);
+  if (b && b.rates && Number(b.rates.THB) > 0) {
+    const rates = Object.assign({}, b.rates);
+    rates[RATES_BASE] = 1;
+    return { base: RATES_BASE, rates: rates, source: "frankfurter" };
+  }
+  return null;
+};
+
+let ratesInFlight = null;
+const pullRatesOnce = () => {
+  if (!ratesInFlight) {
+    ratesInFlight = pullRates().catch(() => null);
+    ratesInFlight.then(
+      () => { ratesInFlight = null; },
+      () => { ratesInFlight = null; }
+    );
+  }
+  return ratesInFlight;
+};
+
+app.get("/api/rates", async (_req, res) => {
+  const cached = readRates();
+  if (cached && Date.now() - Number(cached.fetchedAt || 0) < RATES_TTL_MS) {
+    return res.json(Object.assign({ ok: true }, cached));
+  }
+  const got = await pullRatesOnce();
+  if (got) {
+    const out = { base: got.base, rates: got.rates, source: got.source, fetchedAt: Date.now() };
+    writeRates(out);
+    return res.json(Object.assign({ ok: true }, out));
+  }
+  /* Провайдер недоступен. Старый курс с честной датой лучше пустоты: человек
+     увидит, на какой момент цифры, и сам решит, верить им или нет. */
+  if (cached) return res.json(Object.assign({ ok: true, stale: true }, cached));
+  res.json({ ok: false, error: "no rates" });
+});
 
 /* Сохранить бэкап */
 app.put("/api/backup/:key", (req, res) => {
