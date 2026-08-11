@@ -44,7 +44,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "16" }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "17" }));
 
 /* ── ТЗ-18: курсы валют ──────────────────────────────────────────────────
    Клиент в третьи руки не ходит: провайдеры режут CORS и просят ключей, а
@@ -102,6 +102,11 @@ const pullRates = async () => {
 };
 
 let ratesInFlight = null;
+/* Провайдер лежит — не долбимся в него на каждый запрос. Две попытки по 8
+   секунд на каждое открытие Сводки превратили бы недоступность провайдера в
+   зависающее приложение; старый курс с честной датой отдаётся мгновенно. */
+let ratesFailedAt = 0;
+const FAIL_COOLDOWN_MS = 5 * 60 * 1000;
 const pullRatesOnce = () => {
   if (!ratesInFlight) {
     ratesInFlight = pullRates().catch(() => null);
@@ -118,8 +123,13 @@ app.get("/api/rates", async (_req, res) => {
   if (cached && Date.now() - Number(cached.fetchedAt || 0) < RATES_TTL_MS) {
     return res.json(Object.assign({ ok: true }, cached));
   }
+  if (cached && Date.now() - ratesFailedAt < FAIL_COOLDOWN_MS) {
+    return res.json(Object.assign({ ok: true, stale: true }, cached));
+  }
   const got = await pullRatesOnce();
+  if (!got) ratesFailedAt = Date.now();
   if (got) {
+    ratesFailedAt = 0;
     const out = { base: got.base, rates: got.rates, source: got.source, fetchedAt: Date.now() };
     writeRates(out);
     return res.json(Object.assign({ ok: true }, out));
