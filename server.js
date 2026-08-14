@@ -44,7 +44,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "18" }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "19" }));
 
 /* ── ТЗ-18: курсы валют ──────────────────────────────────────────────────
    Клиент в третьи руки не ходит: провайдеры режут CORS и просят ключей, а
@@ -773,12 +773,13 @@ const P_COLLS = {
   subscriptions: 500,
   drafts: 500,
   goals: 500,
+  tasks: 5000,
 };
 const MAX_PTOMB = 20000;
 const MAX_PERSONAL_BYTES = 4 * 1024 * 1024;
 
 const emptyPersonal = () => ({
-  wallets: [], categories: [], txs: [], subscriptions: [], drafts: [], goals: [],
+  wallets: [], categories: [], txs: [], subscriptions: [], drafts: [], goals: [], tasks: [],
   settings: { updatedAt: 0 },
   pTomb: [],
   rev: 0,
@@ -1002,6 +1003,7 @@ function draftMessage(texts) {
    Оба нужны для проверки: без них поведение можно увидеть только подождав час. */
 async function remindDrafts(opts) {
   const o = opts || {};
+  const only = o.onlyUid || null;
   const { hour } = bangkokNow();
   const quiet = hour >= DRAFT_QUIET_FROM || hour < DRAFT_QUIET_TO;
   const report = { hour, quiet, planned: [] };
@@ -1014,6 +1016,7 @@ async function remindDrafts(opts) {
     if (!rec || !rec.subscription) continue;
 
     const uid = userIdOf(key);
+    if (only && uid !== only) continue;
     const personal = readJson(personalPath(uid), null);
     const kept = personal && Array.isArray(personal.drafts) ? personal.drafts : [];
     const texts = readInbox(uid).map((i) => i && i.text)
@@ -1054,9 +1057,122 @@ async function remindDrafts(opts) {
 setInterval(() => remindDrafts().catch(() => {}), 60 * 60 * 1000);
 
 /* Ручной прогон — им же проверяется поведение в тестах. */
-app.post("/api/push/drafts-check", async (req, res) => {
+app.post("/api/push/drafts-check", auth, async (req, res) => {
   const b = req.body || {};
-  res.json(await remindDrafts({ force: !!b.force, dry: !!b.dry }));
+  res.json(await remindDrafts({ force: !!b.force, dry: !!b.dry, onlyUid: req.userId }));
+});
+
+
+/* ───────────────── ТЗ-24: напоминания о делах ─────────────────
+   Реже, чем о черновиках, и это принципиально. Черновик можно напоминать
+   каждый час, потому что его разбор занимает секунду. Дело так не работает:
+   частые напоминания о том, что человек и так знает, кончаются выключенными
+   уведомлениями — и тогда молчать будет всё, включая нужное.
+
+   Сегодняшнее дело со временем — в ближайший тик после этого времени.
+   Сегодняшнее без времени — утром. Просроченное — раз в сутки, утром. */
+
+const TASK_MORNING = 9;              // час утреннего напоминания
+const TASK_OVERDUE_GAP_MS = 20 * 3600 * 1000;  // «раз в сутки» с запасом на дрожь
+
+const bkkIso = () => {
+  const d = new Date(Date.now() + 7 * 3600 * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`;
+};
+
+function taskPlan(tasks, hour, today, state) {
+  const live = (Array.isArray(tasks) ? tasks : []).filter((t) => t && t.id && t.text && !t.doneAt);
+  const overdue = live.filter((t) => t.due && t.due < today);
+  const now = live.filter((t) => t.due === today);
+
+  /* Дела на сегодня: со временем — когда время настало, без времени — утром. */
+  const due = now.filter((t) => {
+    if (!t.dueTime) return hour >= TASK_MORNING;
+    const h = Number(String(t.dueTime).slice(0, 2));
+    return isFinite(h) && hour >= h;
+  });
+
+  const out = [];
+  for (const t of due) {
+    if ((state.notified || {})[t.id] === today) continue;
+    out.push({ kind: "due", id: t.id, title: "☑️ Сегодня", body: t.text });
+  }
+  if (overdue.length && hour >= TASK_MORNING) {
+    const last = Number(state.overdueAt) || 0;
+    if (Date.now() - last >= TASK_OVERDUE_GAP_MS) {
+      out.push({
+        kind: "overdue",
+        id: null,
+        title: overdue.length === 1 ? "⚠️ Просрочено" : `⚠️ Просрочено: ${overdue.length}`,
+        body: overdue.length === 1 ? overdue[0].text : overdue.slice(0, 3).map((t) => t.text).join(" · "),
+      });
+    }
+  }
+  return out;
+}
+
+async function remindTasks(opts) {
+  const o = opts || {};
+  const only = o.onlyUid || null;
+  const { hour } = bangkokNow();
+  const quiet = hour >= DRAFT_QUIET_FROM || hour < DRAFT_QUIET_TO;
+  const report = { hour, quiet, planned: [] };
+  if (quiet && !o.force) return report;
+
+  const today = bkkIso();
+  const files = fs.readdirSync(PUSH_DIR).filter((f) => f.endsWith(".json"));
+  for (const f of files) {
+    const key = f.replace(/\.json$/, "");
+    const rec = readJson(pushPath(key), null);
+    if (!rec || !rec.subscription) continue;
+
+    const uid = userIdOf(key);
+    if (only && uid !== only) continue;
+    const personal = readJson(personalPath(uid), null);
+    const tasks = personal && Array.isArray(personal.tasks) ? personal.tasks : [];
+    if (!tasks.length) continue;
+
+    const state = rec.taskReminder || {};
+    const plan = taskPlan(tasks, o.force ? 23 : hour, today, o.force ? {} : state);
+    for (const p of plan) {
+      report.planned.push({ key: key.slice(0, 6), kind: p.kind, title: p.title, body: p.body });
+      if (o.dry) continue;
+      try {
+        await webpush.sendNotification(rec.subscription, JSON.stringify({
+          title: p.title,
+          body: p.body,
+          section: "tasks",
+        }));
+        const st = rec.taskReminder || (rec.taskReminder = {});
+        if (p.kind === "overdue") st.overdueAt = Date.now();
+        else {
+          st.notified = st.notified || {};
+          st.notified[p.id] = today;
+        }
+        writeJson(pushPath(key), rec);
+      } catch (e) {
+        console.error("task push error", e && e.statusCode);
+        if (e && (e.statusCode === 404 || e.statusCode === 410)) {
+          delete rec.subscription;
+          writeJson(pushPath(key), rec);
+        }
+      }
+    }
+    /* Отметки о вчерашних делах не копим: словарь должен оставаться маленьким. */
+    if (!o.dry && rec.taskReminder && rec.taskReminder.notified) {
+      const n = rec.taskReminder.notified;
+      for (const id of Object.keys(n)) if (n[id] !== today) delete n[id];
+    }
+  }
+  return report;
+}
+
+setInterval(() => remindTasks().catch(() => {}), 60 * 60 * 1000);
+
+app.post("/api/push/tasks-check", auth, async (req, res) => {
+  const b = req.body || {};
+  res.json(await remindTasks({ force: !!b.force, dry: !!b.dry, onlyUid: req.userId }));
 });
 
 app.listen(PORT, () => console.log(`finappa-server on :${PORT}, data in ${DATA_DIR}`));
