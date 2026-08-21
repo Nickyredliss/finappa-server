@@ -44,7 +44,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "19" }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "20" }));
 
 /* ── ТЗ-18: курсы валют ──────────────────────────────────────────────────
    Клиент в третьи руки не ходит: провайдеры режут CORS и просят ключей, а
@@ -774,12 +774,13 @@ const P_COLLS = {
   drafts: 500,
   goals: 500,
   tasks: 5000,
+  habits: 500,
 };
 const MAX_PTOMB = 20000;
 const MAX_PERSONAL_BYTES = 4 * 1024 * 1024;
 
 const emptyPersonal = () => ({
-  wallets: [], categories: [], txs: [], subscriptions: [], drafts: [], goals: [], tasks: [],
+  wallets: [], categories: [], txs: [], subscriptions: [], drafts: [], goals: [], tasks: [], habits: [],
   settings: { updatedAt: 0 },
   pTomb: [],
   rev: 0,
