@@ -44,7 +44,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "20" }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "21", advisor: !!process.env.ANTHROPIC_API_KEY }));
 
 /* ── ТЗ-18: курсы валют ──────────────────────────────────────────────────
    Клиент в третьи руки не ходит: провайдеры режут CORS и просят ключей, а
@@ -196,7 +196,7 @@ if (VAPID_PUBLIC && VAPID_PRIVATE) {
 
 const pushPath = (key) => path.join(PUSH_DIR, key + ".json");
 const readJson = (p, fallback) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return fallback; } };
-const writeJson = (p, obj) => { const t = p + ".tmp"; fs.writeFileSync(t, JSON.stringify(obj)); fs.renameSync(t, p); };
+const writeJson = (p, obj) => { const t = p + ".tmp"; try { fs.mkdirSync(path.dirname(p), { recursive: true }); } catch {} fs.writeFileSync(t, JSON.stringify(obj)); fs.renameSync(t, p); };
 
 /* Зарегистрировать push-подписку браузера для ключа устройства */
 app.post("/api/push/subscribe/:key", (req, res) => {
@@ -1170,6 +1170,253 @@ async function remindTasks(opts) {
 }
 
 setInterval(() => remindTasks().catch(() => {}), 60 * 60 * 1000);
+
+/* ==================== ТЗ-29: советник ====================
+
+   Ключ берётся ТОЛЬКО из окружения и никогда не покидает сервер.
+   ANTHROPIC_BASE_URL существует ради тестов: суита поднимает локальную
+   заглушку и подставляет её адрес, поэтому проверять логику можно без
+   единого платного запроса и без ключа в репозитории. */
+
+const ADVISOR_MODEL = process.env.ADVISOR_MODEL || "claude-sonnet-5";
+const ADVISOR_BASE = process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com";
+const ADVISOR_DAY_LIMIT = Number(process.env.ADVISOR_DAY_LIMIT) || 40;
+const ADVISOR_MAX_Q = 2000;
+const ADVISOR_MAX_TURNS = 12;
+
+const ADVISOR_DIR = path.join(DATA_DIR, "advisor");
+fs.mkdirSync(ADVISOR_DIR, { recursive: true });
+const advisorPath = (uid) => path.join(ADVISOR_DIR, uid + ".json");
+
+/* Суточный счётчик: день считаем по Бангкоку, как все напоминания. */
+function advisorTake(uid) {
+  const day = bkkIso();
+  const rec = readJson(advisorPath(uid), {});
+  if (rec.day !== day) { rec.day = day; rec.used = 0; }
+  if (pNum(rec.used) >= ADVISOR_DAY_LIMIT) return { ok: false, used: pNum(rec.used), limit: ADVISOR_DAY_LIMIT };
+  rec.used = pNum(rec.used) + 1;
+  writeJson(advisorPath(uid), rec);
+  return { ok: true, used: rec.used, limit: ADVISOR_DAY_LIMIT };
+}
+
+const advNum = (v) => Math.round((Number(v) || 0) * 100) / 100;
+const advDay = (ts) => {
+  const d = new Date(Number(ts) || 0);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+
+/* Дайджест — не сырые данные, а выжимка.
+   Слать 215 операций построчно значит платить за шум: модель всё равно
+   считает по агрегатам. Поэтому категории и итоги считаем здесь, а
+   построчно даём только последние операции — для «что это было». */
+function advisorDigest(uid) {
+  const p = readJson(personalPath(uid), null);
+  if (!p) return null;
+  const today = bkkIso();
+  const month = today.slice(0, 7);
+  const prevMonth = (() => {
+    const d = new Date(today + "T00:00:00Z");
+    d.setUTCDate(1); d.setUTCMonth(d.getUTCMonth() - 1);
+    return d.toISOString().slice(0, 7);
+  })();
+  const cats = Object.fromEntries((p.categories || []).map((c) => [c.id, c]));
+  const wallets = (p.wallets || []).filter((w) => w && !w.sharedId);
+  const wById = Object.fromEntries(wallets.map((w) => [w.id, w]));
+
+  const bal = {};
+  const catMonth = {};
+  const catPrev = {};
+  const totals = { month: {}, prev: {} };
+  for (const t of p.txs || []) {
+    if (!t || t.shared) continue;
+    if (t.type === "transfer") continue; /* переводы учитываются отдельным проходом ниже */
+    const w = wById[t.walletId];
+    if (!w) continue;
+    const inMonth = String(t.date || "").startsWith(month);
+    const inPrev = String(t.date || "").startsWith(prevMonth);
+    if (t.type === "expense" && (inMonth || inPrev)) {
+      const c = cats[t.categoryId];
+      const name = c ? c.name : t.catName || "Прочее";
+      const box = inMonth ? catMonth : catPrev;
+      const k = name + " · " + t.currency;
+      box[k] = advNum((box[k] || 0) + (Number(t.amount) || 0));
+    }
+    if (inMonth || inPrev) {
+      const box = inMonth ? totals.month : totals.prev;
+      const k = t.currency;
+      box[k] = box[k] || { income: 0, expense: 0 };
+      box[k][t.type] = advNum(box[k][t.type] + (Number(t.amount) || 0));
+    }
+  }
+
+  /* Балансы: полный проход, включая переводы — иначе цифра соврёт. */
+  for (const w of wallets) bal[w.id] = {};
+  for (const t of p.txs || []) {
+    if (!t) continue;
+    if (t.type === "transfer") {
+      if (bal[t.fromWalletId]) bal[t.fromWalletId][t.fromCurrency] = advNum((bal[t.fromWalletId][t.fromCurrency] || 0) - (Number(t.fromAmount) || 0));
+      if (bal[t.toWalletId]) bal[t.toWalletId][t.toCurrency] = advNum((bal[t.toWalletId][t.toCurrency] || 0) + (Number(t.toAmount) || 0));
+      continue;
+    }
+    if (!bal[t.walletId]) continue;
+    const sign = t.type === "income" ? 1 : -1;
+    bal[t.walletId][t.currency] = advNum((bal[t.walletId][t.currency] || 0) + sign * (Number(t.amount) || 0));
+  }
+
+  const recent = (p.txs || [])
+    .filter((t) => t && t.type !== "transfer")
+    .sort((a, b) => String(b.date).localeCompare(String(a.date)) || pNum(b.createdAt) - pNum(a.createdAt))
+    .slice(0, 25)
+    .map((t) => ({
+      д: t.date,
+      тип: t.type === "income" ? "доход" : "расход",
+      сумма: advNum(t.amount),
+      вал: t.currency,
+      кат: (cats[t.categoryId] || {}).name || t.catName || "Прочее",
+      кошелёк: (wById[t.walletId] || {}).name || "",
+      комм: String(t.comment || "").slice(0, 60),
+    }));
+
+  const openTasks = (p.tasks || []).filter((t) => t && !t.doneAt).map((t) => ({
+    дело: String(t.text || "").slice(0, 120),
+    срок: t.due || (t.soon ? "на днях" : "когда-нибудь"),
+  }));
+
+  const doneRecent = (p.tasks || [])
+    .filter((t) => t && t.doneAt)
+    .sort((a, b) => pNum(b.doneAt) - pNum(a.doneAt))
+    .slice(0, 60)
+    .map((t) => ({ д: advDay(t.doneAt), дело: String(t.text || "").slice(0, 120) }));
+
+  const habits = (p.habits || []).filter((h) => h && !h.archived).map((h) => {
+    const dd = new Set(h.doneDates || []);
+    let streak = 0;
+    const d = new Date(today + "T00:00:00Z");
+    if (!dd.has(today)) d.setUTCDate(d.getUTCDate() - 1);
+    while (dd.has(d.toISOString().slice(0, 10))) { streak++; d.setUTCDate(d.getUTCDate() - 1); }
+    const last30 = (h.doneDates || []).filter((x) => {
+      const t0 = new Date(today + "T00:00:00Z").getTime();
+      const t1 = new Date(x + "T00:00:00Z").getTime();
+      return t0 - t1 < 30 * 864e5 && t1 <= t0;
+    }).length;
+    return { практика: h.name, сегодня: dd.has(today), серия: streak, за30дней: last30 };
+  });
+
+  const goals = (p.goals || []).filter((g) => g && !g.closedAt).map((g) => ({
+    цель: g.name, нужно: advNum(g.target), отложено: advNum(g.saved), вал: g.currency, срок: g.deadline || null,
+  }));
+
+  const subs = (p.subscriptions || []).map((x) => ({
+    подписка: x.name, сумма: advNum(x.amount), вал: x.currency, день: x.day, период: x.periodicity || "monthly",
+  }));
+
+  return {
+    сегодня: today,
+    кошельки: wallets.map((w) => ({ имя: w.name, балансы: bal[w.id] || {} })),
+    итогМесяца: totals.month,
+    итогПрошлогоМесяца: totals.prev,
+    категорииЭтогоМесяца: catMonth,
+    категорииПрошлогоМесяца: catPrev,
+    последниеОперации: recent,
+    открытыеДела: openTasks,
+    закрытыеДелаНедавно: doneRecent,
+    практики: habits,
+    цели: goals,
+    подписки: subs,
+    черновиковЖдёт: (p.drafts || []).length,
+  };
+}
+
+const ADVISOR_SYSTEM = [
+  "Ты — личный советник Nicky внутри его приложения Finappa. Отвечай по-русски, коротко и по делу.",
+  "У тебя есть выжимка его настоящих данных: деньги, дела, ежедневные практики, цели, подписки.",
+  "",
+  "Правила:",
+  "1. Опирайся на цифры из данных и называй их. Не выдумывай того, чего в данных нет: если не хватает — так и скажи.",
+  "2. Не читай нотаций и не морализируй. Он взрослый человек и знает, что тратит.",
+  "3. Не давай инвестиционных советов и не берись отвечать на «где взять денег» — это не то, на что у приложения есть основания.",
+  "4. Валюты не смешивай молча: THB и USD — разные, при пересчёте говори, что пересчитал приблизительно.",
+  "5. Если он высказывает пожелание к самому приложению — оформи его как ТЗ и заверни в блок ```тз ... ``` с полями ЗАДАЧА / ЗАЧЕМ / КРИТЕРИИ ГОТОВНОСТИ. Скажи, что он может переслать это продакт-менеджеру. Сам ты код приложения не меняешь.",
+  "6. Короткий ответ лучше длинного. Списком — только когда список действительно нужен.",
+].join("\n");
+
+function advisorCall(payload) {
+  return new Promise((resolve, reject) => {
+    let base;
+    try { base = new URL(ADVISOR_BASE); } catch { return reject(new Error("bad base url")); }
+    const lib = base.protocol === "http:" ? require("http") : https;
+    const body = Buffer.from(JSON.stringify(payload), "utf8");
+    const req = lib.request(
+      {
+        protocol: base.protocol,
+        hostname: base.hostname,
+        port: base.port || (base.protocol === "http:" ? 80 : 443),
+        path: (base.pathname === "/" ? "" : base.pathname) + "/v1/messages",
+        method: "POST",
+        timeout: 60000,
+        headers: {
+          "content-type": "application/json",
+          "content-length": body.length,
+          "x-api-key": String(process.env.ANTHROPIC_API_KEY || "").trim(),
+          "anthropic-version": "2023-06-01",
+        },
+      },
+      (r) => {
+        let data = "";
+        r.setEncoding("utf8");
+        r.on("data", (c) => { data += c; if (data.length > 2e6) req.destroy(); });
+        r.on("end", () => {
+          let j = null;
+          try { j = JSON.parse(data); } catch {}
+          if (r.statusCode !== 200 || !j) return reject(new Error("upstream " + r.statusCode + " " + String(data).slice(0, 200)));
+          resolve(j);
+        });
+      }
+    );
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
+app.post("/api/advisor/ask", auth, async (req, res) => {
+  if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: "advisor off", hint: "ANTHROPIC_API_KEY не задан на сервере" });
+  const b = req.body || {};
+  const question = String(b.question || "").trim().slice(0, ADVISOR_MAX_Q);
+  if (!question) return res.status(400).json({ error: "empty question" });
+
+  const digest = advisorDigest(req.userId);
+  if (!digest) return res.status(409).json({ error: "no data", hint: "Данные ещё не синхронизировались" });
+
+  const gate = advisorTake(req.userId);
+  if (!gate.ok) return res.status(429).json({ error: "day limit", used: gate.used, limit: gate.limit });
+
+  const history = Array.isArray(b.history) ? b.history.slice(-ADVISOR_MAX_TURNS) : [];
+  const messages = [];
+  for (const m of history) {
+    const role = m && m.role === "assistant" ? "assistant" : "user";
+    const text = String((m && m.text) || "").slice(0, ADVISOR_MAX_Q);
+    if (text) messages.push({ role, content: text });
+  }
+  messages.push({
+    role: "user",
+    content: "Мои данные на сейчас:\n" + JSON.stringify(digest) + "\n\nВопрос: " + question,
+  });
+
+  try {
+    const out = await advisorCall({
+      model: ADVISOR_MODEL,
+      max_tokens: 1200,
+      system: ADVISOR_SYSTEM,
+      messages,
+    });
+    const text = ((out.content || []).find((c) => c && c.type === "text") || {}).text || "";
+    res.json({ ok: true, answer: text, used: gate.used, limit: gate.limit });
+  } catch (e) {
+    res.status(502).json({ error: "upstream failed", detail: String(e.message || e).slice(0, 200) });
+  }
+});
 
 app.post("/api/push/tasks-check", auth, async (req, res) => {
   const b = req.body || {};
