@@ -44,7 +44,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "23", advisor: !!process.env.ANTHROPIC_API_KEY }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "24", advisor: !!process.env.ANTHROPIC_API_KEY }));
 
 /* ── ТЗ-18: курсы валют ──────────────────────────────────────────────────
    Клиент в третьи руки не ходит: провайдеры режут CORS и просят ключей, а
@@ -1188,6 +1188,8 @@ const ADVISOR_MAX_TURNS = 12;
    → ответил»; больше означало бы, что советник заблудился, и платить за это
    молча не надо. */
 const ADVISOR_MAX_ROUNDS = 3;
+/* Стена карточек — это не помощь, а работа для человека. */
+const ADVISOR_MAX_PROPOSALS = 3;
 
 const ADVISOR_DIR = path.join(DATA_DIR, "advisor");
 fs.mkdirSync(ADVISOR_DIR, { recursive: true });
@@ -1385,6 +1387,72 @@ function advisorFindTx(uid, args) {
   return { найдено: total, показано: rows.length, суммаРасходовПоВалютам: sums, операции: rows };
 }
 
+/* Предложение записи. Здесь НИЧЕГО не создаётся и не сохраняется: мы лишь
+   сверяем предложение с настоящим снимком (кошелёк, валюта, категория,
+   практика, дубли) и возвращаем его — карточку подтверждает человек.
+   Отказ возвращается модели текстом, чтобы она исправилась сама, а не
+   сообщила Nicky выдуманный успех. */
+function advPropose(uid, args) {
+  const p = readJson(personalPath(uid), null);
+  if (!p) return { ok: false, ошибка: "данные не найдены" };
+  const a = args || {};
+  const kind = String(a.kind || "").trim();
+  const title = String(a.title || "").trim().slice(0, 200);
+  const note = String(a.note || "").trim().slice(0, 200);
+  const low = (v) => String(v || "").trim().toLowerCase();
+  const pick = (list, name, field) => {
+    const q = low(name);
+    if (!q) return null;
+    return list.find((x) => low(x[field]) === q) || list.find((x) => low(x[field]).indexOf(q) >= 0) || null;
+  };
+  if (!title) return { ok: false, ошибка: "нужно название" };
+
+  if (kind === "task") {
+    const due = String(a.due || "").trim();
+    if (due && !/^\d{4}-\d{2}-\d{2}$/.test(due)) return { ok: false, ошибка: "срок пиши как ГГГГ-ММ-ДД" };
+    const same = (p.tasks || []).find((t) => t && !t.doneAt && low(t.text) === low(title));
+    if (same) return { ok: false, ошибка: "такое дело уже есть в списке — второе заводить не надо" };
+    return { ok: true, предложение: { kind: "task", title, due: due || null, soon: !!a.soon, note } };
+  }
+
+  if (kind === "habit_mark") {
+    const hs = (p.habits || []).filter((h) => h && !h.archived);
+    const h = pick(hs, title, "name");
+    if (!h) return { ok: false, ошибка: "такой практики нет", практики: hs.map((x) => x.name) };
+    const today = bkkIso();
+    if ((h.doneDates || []).indexOf(today) >= 0) return { ok: false, ошибка: "эта практика уже отмечена сегодня" };
+    return { ok: true, предложение: { kind: "habit_mark", title: h.name, note } };
+  }
+
+  if (kind === "subscription") {
+    const wallets = (p.wallets || []).filter((w) => w && !w.sharedId);
+    if (!wallets.length) return { ok: false, ошибка: "нет ни одного личного кошелька" };
+    const w = a.wallet ? pick(wallets, a.wallet, "name") : wallets[0];
+    if (!w) return { ok: false, ошибка: "такого кошелька нет", кошельки: wallets.map((x) => x.name) };
+    const amount = Number(a.amount);
+    if (!(amount > 0)) return { ok: false, ошибка: "нужна сумма больше нуля" };
+    const curs = Array.isArray(w.currencies) && w.currencies.length ? w.currencies : ["THB"];
+    const cur = String(a.currency || "").trim().toUpperCase() || curs[0];
+    if (curs.indexOf(cur) < 0) return { ok: false, ошибка: "в кошельке «" + w.name + "» нет валюты " + cur, валюты: curs };
+    const day = Math.round(Number(a.day));
+    if (!(day >= 1 && day <= 31)) return { ok: false, ошибка: "день списания — число от 1 до 31" };
+    const period = a.period === "yearly" ? "yearly" : "monthly";
+    const month = period === "yearly" ? Math.min(12, Math.max(1, Math.round(Number(a.month) || 1))) : null;
+    const c = a.category ? pick(p.categories || [], a.category, "name") : null;
+    if (a.category && !c) return { ok: false, ошибка: "такой категории нет", категории: (p.categories || []).map((x) => x.name) };
+    const dup = (p.subscriptions || []).find((x) => x && low(x.name) === low(title));
+    if (dup) return { ok: false, ошибка: "такая подписка уже есть: " + dup.name + ", " + advNum(dup.amount) + " " + dup.currency + ", " + dup.day + "-го" };
+    const paid = String(a.paid_on || "").trim();
+    if (paid && !/^\d{4}-\d{2}-\d{2}$/.test(paid)) return { ok: false, ошибка: "paid_on пиши как ГГГГ-ММ-ДД" };
+    return {
+      ok: true,
+      предложение: { kind: "subscription", title, amount: advNum(amount), currency: cur, wallet: w.name,
+        category: c ? c.name : null, day, period, month, paidOn: paid || null, note },
+    };
+  }
+  return { ok: false, ошибка: "неизвестный вид записи" };
+}
+
 const ADVISOR_TOOLS = [
   {
     name: "find_transactions",
@@ -1403,6 +1471,30 @@ const ADVISOR_TOOLS = [
       },
     },
   },
+  {
+    name: "propose_record",
+    description:
+      "Предложить Nicky создать запись: подписку, дело или отметку сегодняшней практики. Ты НЕ создаёшь запись — предложение появляется у него карточкой с кнопкой, нажимает он сам. Ответ инструмента скажет, принято предложение или отклонено (например, такая подписка уже есть); опирайся в тексте на этот ответ и НИКОГДА не пиши, что запись создана, добавлена или отмечена.",
+    input_schema: {
+      type: "object",
+      required: ["kind", "title"],
+      properties: {
+        kind: { type: "string", enum: ["subscription", "task", "habit_mark"], description: "Что предложить: subscription — регулярный платёж, task — дело, habit_mark — отметить сегодняшнюю практику." },
+        title: { type: "string", description: "Название подписки, текст дела или название практики — точно как она называется в ежедневнике." },
+        amount: { type: "number", description: "Только для подписки: сумма списания." },
+        currency: { type: "string", description: "Только для подписки: валюта, например THB. Должна быть в этом кошельке." },
+        wallet: { type: "string", description: "Только для подписки: имя кошелька. Без него берётся первый личный." },
+        category: { type: "string", description: "Только для подписки: имя существующей категории." },
+        day: { type: "number", description: "Только для подписки: день списания, 1–31." },
+        period: { type: "string", enum: ["monthly", "yearly"], description: "Только для подписки: раз в месяц или раз в год. По умолчанию monthly." },
+        month: { type: "number", description: "Только для годовой подписки: месяц списания, 1–12." },
+        paid_on: { type: "string", description: "Только для подписки: дата уже записанного расхода за текущий период, ГГГГ-ММ-ДД. Передавай ВСЕГДА, когда подписка делается из найденной операции, — иначе приложение предложит записать этот же платёж второй раз." },
+        due: { type: "string", description: "Только для дела: срок, ГГГГ-ММ-ДД." },
+        soon: { type: "boolean", description: "Только для дела без срока: пометить «в ближайшее время»." },
+        note: { type: "string", description: "Одна короткая строка на карточке — почему ты это предлагаешь." },
+      },
+    },
+  },
 ];
 
 /* Карта приложения. Половина «не могу» у советника была не про данные, а про
@@ -1415,7 +1507,7 @@ const ADVISOR_APP = [
   "  – История: режимы День/Неделя/Месяц/Период (произвольные даты), поиск по комментарию и категории.",
   "  – Сводка: Месяц или Период, итоги в одной валюте по курсу, разбивка по категориям, «Сколько уходит в месяц».",
   "  – Ещё: подписки, оформление (светлая/тёмная), бэкап и код восстановления, автозапись (инбокс).",
-  "• ВАЖНО: чтобы сделать из уже записанного расхода регулярную подписку, надо открыть эту запись в Истории и нажать «🔁 Сделать подпиской» — сумма, валюта, кошелёк, категория и день списания подставятся из записи. Это готовый путь для просьб вида «добавь X в ежемесячные подписки».",
+  "• Подписка из уже записанного расхода: руками это «открыть запись в Истории → 🔁 Сделать подпиской», но быстрее предложить её самому — propose_record с kind=subscription и обязательно paid_on = дата той операции, чтобы этот месяц не посчитался дважды.",
   "• Дела — вкладки: Дела, Ежедневник, Журнал.",
   "  – Дела: срок можно писать прямо во фразе («позвонить в банк завтра», «оплатить визу 12 сентября», «купить масло на днях»). Кнопка ☀️ ставит дело в план на сегодня, ↩ возвращает обратно.",
   "  – Ежедневник: ежедневные практики, отметка касанием, серия дней.",
@@ -1431,6 +1523,9 @@ const ADVISOR_SYSTEM = [
   "1. Опирайся на цифры из данных и называй их. Не выдумывай того, чего в данных нет: если не хватает — так и скажи.",
   "1а. В выжимке лежат только последние 25 операций, а всего их могут быть сотни. Как только речь заходит о КОНКРЕТНОЙ записи, её дате или сумме — не отвечай «не вижу», а вызови инструмент find_transactions. Сказать «в последних операциях этого нет» вместо поиска — ошибка.",
   "1б. Сначала посмотри, умеет ли нужное само приложение (список ниже), и предложи готовый путь: куда нажать. ТЗ на доработку оформляй, только если такого пути действительно нет.",
+  "1в. Ты можешь ПРЕДЛОЖИТЬ запись инструментом propose_record: подписку, дело или отметку сегодняшней практики. Создать её ты не можешь — карточку подтверждает он касанием. Поэтому пиши «предлагаю», «подтверди на карточке», и никогда «создал», «добавил», «отметил». Если инструмент вернул ok:false — скажи честно, что не вышло и почему.",
+  "1г. Расходы и доходы предлагать нельзя — их он записывает сам, это уже быстро. Удалять и править существующие записи ты тоже не можешь.",
+  "1д. Не больше трёх предложений в одном ответе. Предлагай то, о чём он попросил или что прямо следует из разговора, а не всё, что пришло в голову.",
   "2. Не читай нотаций и не морализируй. Он взрослый человек и знает, что тратит.",
   "3. Не давай инвестиционных советов и не берись отвечать на «где взять денег» — это не то, на что у приложения есть основания.",
   "4. Валюты не смешивай молча: THB и USD — разные, при пересчёте говори, что пересчитал приблизительно.",
@@ -1508,6 +1603,7 @@ app.post("/api/advisor/ask", auth, async (req, res) => {
     let out = null;
     let rounds = 0;
     const usedTools = [];
+    const proposals = [];
     while (rounds < ADVISOR_MAX_ROUNDS) {
       rounds++;
       out = await advisorCall({
@@ -1524,17 +1620,28 @@ app.post("/api/advisor/ask", auth, async (req, res) => {
       for (const c of calls) {
         let r;
         try {
-          r = c.name === "find_transactions" ? advisorFindTx(req.userId, c.input) : { ошибка: "неизвестный инструмент" };
+          if (c.name === "find_transactions") r = advisorFindTx(req.userId, c.input);
+          else if (c.name === "propose_record") {
+            if (proposals.length >= ADVISOR_MAX_PROPOSALS) {
+              r = { ok: false, ошибка: "за один ответ показываем не больше трёх предложений" };
+            } else {
+              r = advPropose(req.userId, c.input);
+              if (r && r.ok) {
+                proposals.push(Object.assign({ id: "pr" + (proposals.length + 1) + Date.now().toString(36) }, r.предложение));
+                r = { ok: true, показано: "Карточка показана Nicky. Он подтверждает её сам — не пиши, что запись создана." };
+              }
+            }
+          } else r = { ошибка: "неизвестный инструмент" };
         } catch (e) {
-          r = { ошибка: String(e.message || e).slice(0, 120) };
+          r = { ok: false, ошибка: String(e.message || e).slice(0, 120) };
         }
-        usedTools.push({ tool: c.name, args: c.input, found: r && r.найдено });
+        usedTools.push({ tool: c.name, args: c.input, found: r && r.найдено, ok: r && r.ok });
         results.push({ type: "tool_result", tool_use_id: c.id, content: JSON.stringify(r) });
       }
       messages.push({ role: "user", content: results });
     }
     const text = ((( out || {}).content || []).find((c) => c && c.type === "text") || {}).text || "";
-    res.json({ ok: true, answer: text, used: gate.used, limit: gate.limit, rounds, tools: usedTools });
+    res.json({ ok: true, answer: text, used: gate.used, limit: gate.limit, rounds, tools: usedTools, proposals });
   } catch (e) {
     res.status(502).json({ error: "upstream failed", detail: String(e.message || e).slice(0, 200) });
   }
