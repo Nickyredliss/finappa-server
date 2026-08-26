@@ -44,7 +44,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "22", advisor: !!process.env.ANTHROPIC_API_KEY }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "23", advisor: !!process.env.ANTHROPIC_API_KEY }));
 
 /* ── ТЗ-18: курсы валют ──────────────────────────────────────────────────
    Клиент в третьи руки не ходит: провайдеры режут CORS и просят ключей, а
@@ -1184,6 +1184,10 @@ const ADVISOR_BASE = process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.co
 const ADVISOR_DAY_LIMIT = Number(process.env.ADVISOR_DAY_LIMIT) || 40;
 const ADVISOR_MAX_Q = 2000;
 const ADVISOR_MAX_TURNS = 12;
+/* Каждый круг — отдельный платный запрос. Три хватает на «поискал → уточнил
+   → ответил»; больше означало бы, что советник заблудился, и платить за это
+   молча не надо. */
+const ADVISOR_MAX_ROUNDS = 3;
 
 const ADVISOR_DIR = path.join(DATA_DIR, "advisor");
 fs.mkdirSync(ADVISOR_DIR, { recursive: true });
@@ -1334,18 +1338,106 @@ function advisorDigest(uid) {
   };
 }
 
+/* Поиск по операциям. Всё считается здесь: модели отдаём только найденное,
+   иначе смысл выжимки теряется и мы снова платим за шум. */
+function advisorFindTx(uid, args) {
+  const p = readJson(personalPath(uid), null);
+  if (!p) return { найдено: 0, операции: [] };
+  const a = args || {};
+  const cats = Object.fromEntries((p.categories || []).map((c) => [c.id, c]));
+  const wl = Object.fromEntries((p.wallets || []).map((w) => [w.id, w]));
+  const q = String(a.текст || a.text || "").trim().toLowerCase();
+  const cat = String(a.категория || a.category || "").trim().toLowerCase();
+  const from = String(a.с || a.from || "");
+  const to = String(a.по || a.to || "");
+  const sum = a.сумма === undefined ? null : Number(a.сумма);
+  const type = String(a.тип || a.type || "").trim();
+  const limit = Math.min(60, Math.max(1, Number(a.сколько || a.limit) || 40));
+
+  const out = [];
+  for (const t of p.txs || []) {
+    if (!t || t.shared) continue;
+    if (t.type === "transfer") continue;
+    const catName = String((cats[t.categoryId] || {}).name || t.catName || "Прочее");
+    const cm = String(t.comment || "");
+    if (from && String(t.date || "") < from) continue;
+    if (to && String(t.date || "") > to) continue;
+    if (type && t.type !== type) continue;
+    if (cat && catName.toLowerCase().indexOf(cat) < 0) continue;
+    if (sum !== null && Math.abs((Number(t.amount) || 0) - sum) > 0.009) continue;
+    if (q && (catName + " " + cm).toLowerCase().indexOf(q) < 0) continue;
+    out.push({
+      дата: t.date,
+      тип: t.type === "income" ? "доход" : "расход",
+      сумма: advNum(t.amount),
+      валюта: t.currency,
+      категория: catName,
+      комментарий: cm.slice(0, 80),
+      кошелёк: String((wl[t.walletId] || {}).name || ""),
+    });
+  }
+  out.sort((x, y) => String(y.дата).localeCompare(String(x.дата)));
+  const total = out.length;
+  const rows = out.slice(0, limit);
+  const sums = {};
+  for (const r of out) sums[r.валюта] = advNum((sums[r.валюта] || 0) + (r.тип === "расход" ? r.сумма : 0));
+  return { найдено: total, показано: rows.length, суммаРасходовПоВалютам: sums, операции: rows };
+}
+
+const ADVISOR_TOOLS = [
+  {
+    name: "найти_операции",
+    description:
+      "Найти операции пользователя по любым признакам. Используй ВСЕГДА, когда нужна конкретная запись, её дата или сумма: в готовой выжимке лежат только последние 25 операций, а всего их могут быть сотни. Возвращает найденные операции с датами, суммами, категориями и комментариями.",
+    input_schema: {
+      type: "object",
+      properties: {
+        текст: { type: "string", description: "Искать в названии категории и в комментарии, например «зал», «абонемент», «Лазада»." },
+        категория: { type: "string", description: "Название категории целиком или частью, например «спорт»." },
+        сумма: { type: "number", description: "Точная сумма операции." },
+        тип: { type: "string", enum: ["expense", "income"], description: "Только расходы или только доходы." },
+        "с": { type: "string", description: "Дата начала периода, ГГГГ-ММ-ДД." },
+        "по": { type: "string", description: "Дата конца периода, ГГГГ-ММ-ДД." },
+        сколько: { type: "number", description: "Сколько операций вернуть, по умолчанию 40, максимум 60." },
+      },
+    },
+  },
+];
+
+/* Карта приложения. Половина «не могу» у советника была не про данные, а про
+   незнание того, что нужная кнопка уже существует. */
+const ADVISOR_APP = [
+  "Что умеет само приложение (предлагай готовый путь ПРЕЖДЕ чем оформлять ТЗ):",
+  "• Разделы в шапке: «💳 Деньги», «✅ Дела», «🧠 Советник».",
+  "• Деньги — вкладки внизу: Кошелёк, История, Сводка, Ещё.",
+  "  – Кошелёк: балансы, «− Расход» и «+ Доход» (сохраняет касание категории), «⇄ Перевод», блок подписок и целей.",
+  "  – История: режимы День/Неделя/Месяц/Период (произвольные даты), поиск по комментарию и категории.",
+  "  – Сводка: Месяц или Период, итоги в одной валюте по курсу, разбивка по категориям, «Сколько уходит в месяц».",
+  "  – Ещё: подписки, оформление (светлая/тёмная), бэкап и код восстановления, автозапись (инбокс).",
+  "• ВАЖНО: чтобы сделать из уже записанного расхода регулярную подписку, надо открыть эту запись в Истории и нажать «🔁 Сделать подпиской» — сумма, валюта, кошелёк, категория и день списания подставятся из записи. Это готовый путь для просьб вида «добавь X в ежемесячные подписки».",
+  "• Дела — вкладки: Дела, Ежедневник, Журнал.",
+  "  – Дела: срок можно писать прямо во фразе («позвонить в банк завтра», «оплатить визу 12 сентября», «купить масло на днях»). Кнопка ☀️ ставит дело в план на сегодня, ↩ возвращает обратно.",
+  "  – Ежедневник: ежедневные практики, отметка касанием, серия дней.",
+  "  – Журнал: что и когда было сделано, по дням.",
+  "• Записать трату можно снаружи приложения: Быстрая команда на телефоне шлёт текст в инбокс, оттуда он приходит черновиком.",
+].join("\n");
+
 const ADVISOR_SYSTEM = [
   "Ты — личный советник Nicky внутри его приложения Finappa. Отвечай по-русски, коротко и по делу.",
   "У тебя есть выжимка его настоящих данных: деньги, дела, ежедневные практики, цели, подписки.",
   "",
   "Правила:",
   "1. Опирайся на цифры из данных и называй их. Не выдумывай того, чего в данных нет: если не хватает — так и скажи.",
+  "1а. В выжимке лежат только последние 25 операций, а всего их могут быть сотни. Как только речь заходит о КОНКРЕТНОЙ записи, её дате или сумме — не отвечай «не вижу», а вызови инструмент найти_операции. Сказать «в последних операциях этого нет» вместо поиска — ошибка.",
+  "1б. Сначала посмотри, умеет ли нужное само приложение (список ниже), и предложи готовый путь: куда нажать. ТЗ на доработку оформляй, только если такого пути действительно нет.",
   "2. Не читай нотаций и не морализируй. Он взрослый человек и знает, что тратит.",
   "3. Не давай инвестиционных советов и не берись отвечать на «где взять денег» — это не то, на что у приложения есть основания.",
   "4. Валюты не смешивай молча: THB и USD — разные, при пересчёте говори, что пересчитал приблизительно.",
   "5. Если он высказывает пожелание к самому приложению — оформи его как ТЗ и заверни в блок ```тз ... ``` с полями ЗАДАЧА / ЗАЧЕМ / КРИТЕРИИ ГОТОВНОСТИ. Под блоком появится кнопка «Отправить в работу» — нажимает её он, не ты. Сам ты код приложения не меняешь.",
   "5а. В данных есть список «пожелания» — то, что уже отправлено продакт-менеджеру. Сверься с ним перед тем, как оформлять новое: если такое уже отправлено, скажи об этом вместо дубля.",
   "6. Короткий ответ лучше длинного. Списком — только когда список действительно нужен.",
+  "",
+  ADVISOR_APP,
 ].join("\n");
 
 function advisorCall(payload) {
@@ -1412,14 +1504,36 @@ app.post("/api/advisor/ask", auth, async (req, res) => {
   });
 
   try {
-    const out = await advisorCall({
-      model: ADVISOR_MODEL,
-      max_tokens: 1200,
-      system: ADVISOR_SYSTEM,
-      messages,
-    });
-    const text = ((out.content || []).find((c) => c && c.type === "text") || {}).text || "";
-    res.json({ ok: true, answer: text, used: gate.used, limit: gate.limit });
+    let out = null;
+    let rounds = 0;
+    const usedTools = [];
+    while (rounds < ADVISOR_MAX_ROUNDS) {
+      rounds++;
+      out = await advisorCall({
+        model: ADVISOR_MODEL,
+        max_tokens: 1500,
+        system: ADVISOR_SYSTEM,
+        tools: ADVISOR_TOOLS,
+        messages,
+      });
+      const calls = (out.content || []).filter((c) => c && c.type === "tool_use");
+      if (!calls.length) break;
+      messages.push({ role: "assistant", content: out.content });
+      const results = [];
+      for (const c of calls) {
+        let r;
+        try {
+          r = c.name === "найти_операции" ? advisorFindTx(req.userId, c.input) : { ошибка: "неизвестный инструмент" };
+        } catch (e) {
+          r = { ошибка: String(e.message || e).slice(0, 120) };
+        }
+        usedTools.push({ tool: c.name, args: c.input, found: r && r.найдено });
+        results.push({ type: "tool_result", tool_use_id: c.id, content: JSON.stringify(r) });
+      }
+      messages.push({ role: "user", content: results });
+    }
+    const text = ((( out || {}).content || []).find((c) => c && c.type === "text") || {}).text || "";
+    res.json({ ok: true, answer: text, used: gate.used, limit: gate.limit, rounds, tools: usedTools });
   } catch (e) {
     res.status(502).json({ error: "upstream failed", detail: String(e.message || e).slice(0, 200) });
   }
