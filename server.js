@@ -44,7 +44,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "24", advisor: !!process.env.ANTHROPIC_API_KEY }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "25", advisor: !!process.env.ANTHROPIC_API_KEY }));
 
 /* ── ТЗ-18: курсы валют ──────────────────────────────────────────────────
    Клиент в третьи руки не ходит: провайдеры режут CORS и просят ключей, а
@@ -1271,6 +1271,12 @@ function advisorDigest(uid) {
     bal[t.walletId][t.currency] = advNum((bal[t.walletId][t.currency] || 0) + sign * (Number(t.amount) || 0));
   }
 
+  /* Обмены не расходы, поэтому в итогах их нет — но человек про них
+     спрашивает, и до ТЗ-33 они были не видны советнику вообще. */
+  const monthTransfers = (p.txs || [])
+    .filter((t) => t && !t.shared && t.type === "transfer" && String(t.date || "").startsWith(month))
+    .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+
   const recent = (p.txs || [])
     .filter((t) => t && t.type !== "transfer")
     .sort((a, b) => String(b.date).localeCompare(String(a.date)) || pNum(b.createdAt) - pNum(a.createdAt))
@@ -1331,6 +1337,8 @@ function advisorDigest(uid) {
     практики: habits,
     цели: goals,
     подписки: subs,
+    обменыИПереводыЭтогоМесяца: monthTransfers.slice(0, 20).map((t) => advTransferRow(t, wById)),
+    итогоПоОбменамЭтогоМесяца: advTransferTotals(monthTransfers),
     черновиковЖдёт: (p.drafts || []).length,
     пожелания: (p.wishes || []).map((w) => ({
       что: String((w && w.text) || "").slice(0, 200),
@@ -1338,6 +1346,47 @@ function advisorDigest(uid) {
       сделано: !!(w && w.doneAt),
     })),
   };
+}
+
+/* Обмен и перевод — одна сущность (type: "transfer"), но человеку это две
+   разные вещи: обмен валюты ВНУТРИ кошелька и перевод МЕЖДУ кошельками.
+   Различаем по кошелькам и называем словами, иначе модель будет гадать. */
+function advTransferRow(t, wl) {
+  const same = t.fromWalletId === t.toWalletId;
+  const fa = advNum(t.fromAmount);
+  const ta = advNum(t.toAmount);
+  const row = {
+    дата: t.date,
+    тип: same ? "обмен" : "перевод",
+    отдал: fa + " " + t.fromCurrency,
+    получил: ta + " " + t.toCurrency,
+    комментарий: String(t.comment || "").slice(0, 80),
+  };
+  if (t.fromCurrency !== t.toCurrency && fa > 0) row.курс = advNum(ta / fa);
+  if (same) row.кошелёк = String((wl[t.fromWalletId] || {}).name || "");
+  else {
+    row.изКошелька = String((wl[t.fromWalletId] || {}).name || "");
+    row.вКошелёк = String((wl[t.toWalletId] || {}).name || "");
+  }
+  return row;
+}
+
+/* Итоги по обменам считаем здесь же: складывать десять строк — ровно то, на
+   чём языковая модель ошибается правдоподобно. */
+function advTransferTotals(list) {
+  const out = {};
+  for (const t of list) {
+    const k = t.fromCurrency + "→" + t.toCurrency;
+    const b = (out[k] = out[k] || { сколькоРаз: 0, отдано: 0, получено: 0 });
+    b.сколькоРаз++;
+    b.отдано = advNum(b.отдано + (Number(t.fromAmount) || 0));
+    b.получено = advNum(b.получено + (Number(t.toAmount) || 0));
+  }
+  for (const k of Object.keys(out)) {
+    const b = out[k];
+    if (b.отдано > 0) b.среднийКурс = advNum(b.получено / b.отдано);
+  }
+  return out;
 }
 
 /* Поиск по операциям. Всё считается здесь: модели отдаём только найденное,
@@ -1355,12 +1404,33 @@ function advisorFindTx(uid, args) {
   const sumRaw = a.amount !== undefined ? a.amount : a.сумма;
   const sum = sumRaw === undefined || sumRaw === null || sumRaw === "" ? null : Number(sumRaw);
   const type = String(a.тип || a.type || "").trim();
+  const wal = String(a.кошелёк || a.wallet || "").trim().toLowerCase();
   const limit = Math.min(60, Math.max(1, Number(a.сколько || a.limit) || 40));
+  const inWallet = (id) => !wal || String((wl[id] || {}).name || "").toLowerCase().indexOf(wal) >= 0;
 
   const out = [];
+  const trans = [];
   for (const t of p.txs || []) {
     if (!t || t.shared) continue;
-    if (t.type === "transfer") continue;
+    if (t.type === "transfer") {
+      /* Обмен не расход и не доход: под фильтр по категории он не подходит по
+         смыслу, поэтому при поиске по категории его не показываем вовсе. */
+      if (type && type !== "transfer") continue;
+      if (cat) continue;
+      if (from && String(t.date || "") < from) continue;
+      if (to && String(t.date || "") > to) continue;
+      if (!inWallet(t.fromWalletId) && !inWallet(t.toWalletId)) continue;
+      if (sum !== null && Math.abs((Number(t.fromAmount) || 0) - sum) > 0.009 && Math.abs((Number(t.toAmount) || 0) - sum) > 0.009) continue;
+      if (q) {
+        const hay = (String(t.comment || "") + " " + String((wl[t.fromWalletId] || {}).name || "") + " " + String((wl[t.toWalletId] || {}).name || "") + " обмен перевод").toLowerCase();
+        if (hay.indexOf(q) < 0) continue;
+      }
+      trans.push(t);
+      out.push(advTransferRow(t, wl));
+      continue;
+    }
+    if (type === "transfer") continue;
+    if (!inWallet(t.walletId)) continue;
     const catName = String((cats[t.categoryId] || {}).name || t.catName || "Прочее");
     const cm = String(t.comment || "");
     if (from && String(t.date || "") < from) continue;
@@ -1383,8 +1453,13 @@ function advisorFindTx(uid, args) {
   const total = out.length;
   const rows = out.slice(0, limit);
   const sums = {};
-  for (const r of out) sums[r.валюта] = advNum((sums[r.валюта] || 0) + (r.тип === "расход" ? r.сумма : 0));
-  return { найдено: total, показано: rows.length, суммаРасходовПоВалютам: sums, операции: rows };
+  for (const r of out) {
+    if (r.тип !== "расход") continue; /* иначе у обмена нет .валюта и в итог лезет ключ undefined */
+    sums[r.валюта] = advNum((sums[r.валюта] || 0) + r.сумма);
+  }
+  const res = { найдено: total, показано: rows.length, суммаРасходовПоВалютам: sums, операции: rows };
+  if (trans.length) res.итогоПоОбменам = advTransferTotals(trans);
+  return res;
 }
 
 /* Предложение записи. Здесь НИЧЕГО не создаётся и не сохраняется: мы лишь
@@ -1457,14 +1532,15 @@ const ADVISOR_TOOLS = [
   {
     name: "find_transactions",
     description:
-      "Найти операции пользователя по любым признакам. Используй ВСЕГДА, когда нужна конкретная запись, её дата или сумма: в готовой выжимке лежат только последние 25 операций, а всего их могут быть сотни. Возвращает найденные операции с датами, суммами, категориями и комментариями.",
+      "Найти операции пользователя по любым признакам: расходы, доходы, а также обмены валюты и переводы между кошельками (type=transfer). Используй ВСЕГДА, когда нужна конкретная запись, её дата или сумма: в готовой выжимке лежат только последние 25 операций и обмены текущего месяца, а всего операций могут быть сотни. Возвращает найденное с датами, суммами, категориями, кошельками, а для обменов — курс и итоги по парам валют.",
     input_schema: {
       type: "object",
       properties: {
         text: { type: "string", description: "Искать в названии категории и в комментарии, например «зал», «абонемент», «Лазада»." },
         category: { type: "string", description: "Название категории целиком или частью, например «спорт»." },
         amount: { type: "number", description: "Точная сумма операции." },
-        type: { type: "string", enum: ["expense", "income"], description: "Только расходы или только доходы." },
+        type: { type: "string", enum: ["expense", "income", "transfer"], description: "Только расходы, только доходы или только обмены и переводы (transfer)." },
+        wallet: { type: "string", description: "Имя кошелька целиком или частью, например «Личный» или «Агасси». Без него ищем по всем." },
         from: { type: "string", description: "Дата начала периода, ГГГГ-ММ-ДД." },
         to: { type: "string", description: "Дата конца периода, ГГГГ-ММ-ДД." },
         limit: { type: "number", description: "Сколько операций вернуть, по умолчанию 40, максимум 60." },
@@ -1504,6 +1580,7 @@ const ADVISOR_APP = [
   "• Разделы в шапке: «💳 Деньги», «✅ Дела», «🧠 Советник».",
   "• Деньги — вкладки внизу: Кошелёк, История, Сводка, Ещё.",
   "  – Кошелёк: балансы, «− Расход» и «+ Доход» (сохраняет касание категории), «⇄ Перевод», блок подписок и целей.",
+  "  – «⇄ Перевод» — это и перевод между кошельками, и обмен валюты внутри одного кошелька (USD→THB): указываются отданная и полученная суммы, курс считается из них. В расходы и доходы такие операции не входят никогда.",
   "  – История: режимы День/Неделя/Месяц/Период (произвольные даты), поиск по комментарию и категории.",
   "  – Сводка: Месяц или Период, итоги в одной валюте по курсу, разбивка по категориям, «Сколько уходит в месяц».",
   "  – Ещё: подписки, оформление (светлая/тёмная), бэкап и код восстановления, автозапись (инбокс).",
@@ -1524,6 +1601,7 @@ const ADVISOR_SYSTEM = [
   "1а. В выжимке лежат только последние 25 операций, а всего их могут быть сотни. Как только речь заходит о КОНКРЕТНОЙ записи, её дате или сумме — не отвечай «не вижу», а вызови инструмент find_transactions. Сказать «в последних операциях этого нет» вместо поиска — ошибка.",
   "1б. Сначала посмотри, умеет ли нужное само приложение (список ниже), и предложи готовый путь: куда нажать. ТЗ на доработку оформляй, только если такого пути действительно нет.",
   "1в. Ты можешь ПРЕДЛОЖИТЬ запись инструментом propose_record: подписку, дело или отметку сегодняшней практики. Создать её ты не можешь — карточку подтверждает он касанием. Поэтому пиши «предлагаю», «подтверди на карточке», и никогда «создал», «добавил», «отметил». Если инструмент вернул ok:false — скажи честно, что не вышло и почему.",
+  "1е. Обмен валюты и перевод между кошельками — это операции типа transfer. Они НЕ расходы и НЕ доходы, поэтому их нет ни в итогах месяца, ни в «последниеОперации». Обмены текущего месяца лежат в выжимке отдельным полем; за другой период ищи инструментом с type=transfer. Отвечать «обменов не нашлось», не заглянув туда, — ошибка.",
   "1г. Расходы и доходы предлагать нельзя — их он записывает сам, это уже быстро. Удалять и править существующие записи ты тоже не можешь.",
   "1д. Не больше трёх предложений в одном ответе. Предлагай то, о чём он попросил или что прямо следует из разговора, а не всё, что пришло в голову.",
   "2. Не читай нотаций и не морализируй. Он взрослый человек и знает, что тратит.",
