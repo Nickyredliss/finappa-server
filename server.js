@@ -44,7 +44,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "27", advisor: !!process.env.ANTHROPIC_API_KEY }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "28", advisor: !!process.env.ANTHROPIC_API_KEY }));
 
 /* ── ТЗ-18: курсы валют ──────────────────────────────────────────────────
    Клиент в третьи руки не ходит: провайдеры режут CORS и просят ключей, а
@@ -199,17 +199,61 @@ const readJson = (p, fallback) => { try { return JSON.parse(fs.readFileSync(p, "
 const writeJson = (p, obj) => { const t = p + ".tmp"; try { fs.mkdirSync(path.dirname(p), { recursive: true }); } catch {} fs.writeFileSync(t, JSON.stringify(obj)); fs.renameSync(t, p); };
 
 /* Зарегистрировать push-подписку браузера для ключа устройства */
+/* Подписок на аккаунт может быть несколько: у одного человека телефон, мак
+   и рабочий браузер, а код восстановления один. Раньше поле было одно, и
+   каждое новое устройство затирало предыдущее — пуши уходили в никуда.
+   Старую запись читаем как список из одного элемента. */
+const PUSH_MAX_DEVICES = 5;
+function pushList(rec) {
+  if (!rec) return [];
+  const out = Array.isArray(rec.subscriptions) ? rec.subscriptions.filter((x) => x && x.endpoint) : [];
+  if (rec.subscription && rec.subscription.endpoint && !out.some((x) => x.endpoint === rec.subscription.endpoint)) {
+    out.unshift(rec.subscription);
+  }
+  return out;
+}
+
+/* Отправка всем устройствам. Возвращает, сколько доставлено и сколько
+   отвалилось: молчаливая неудача — то, из-за чего человек неделю думает,
+   что уведомления просто «не работают». */
+async function pushAll(key, rec, payload) {
+  const list = pushList(rec);
+  let sent = 0;
+  const dead = [];
+  for (const sub of list) {
+    try {
+      await webpush.sendNotification(sub, JSON.stringify(payload));
+      sent++;
+    } catch (e) {
+      const code = e && e.statusCode;
+      console.error("push error", code, String(sub.endpoint || "").slice(0, 40));
+      if (code === 404 || code === 410) dead.push(sub.endpoint);
+    }
+  }
+  if (dead.length) {
+    rec.subscriptions = pushList(rec).filter((x) => dead.indexOf(x.endpoint) < 0);
+    delete rec.subscription;
+    writeJson(pushPath(key), rec);
+  }
+  return { sent, dead: dead.length, total: list.length };
+}
+
 app.post("/api/push/subscribe/:key", (req, res) => {
   const { key } = req.params;
   if (!KEY_RE.test(key)) return res.status(400).json({ error: "bad key" });
   const { subscription } = req.body || {};
   if (!subscription || !subscription.endpoint) return res.status(400).json({ error: "subscription required" });
   const rec = readJson(pushPath(key), {});
-  rec.subscription = subscription;
+  /* Устройство узнаём по endpoint: повторное включение на том же телефоне
+     обновляет запись, а не плодит дубли. */
+  const list = pushList(rec).filter((x) => x.endpoint !== subscription.endpoint);
+  list.unshift(Object.assign({}, subscription, { addedAt: Date.now() }));
+  rec.subscriptions = list.slice(0, PUSH_MAX_DEVICES);
+  delete rec.subscription;
   rec.updatedAt = new Date().toISOString();
   rec.notified = rec.notified || {};
   writeJson(pushPath(key), rec);
-  res.json({ ok: true });
+  res.json({ ok: true, devices: rec.subscriptions.length });
 });
 
 /* Тестовое уведомление — для проверки с телефона */
@@ -217,16 +261,28 @@ app.post("/api/push/test/:key", async (req, res) => {
   const { key } = req.params;
   if (!KEY_RE.test(key)) return res.status(400).json({ error: "bad key" });
   const rec = readJson(pushPath(key), null);
-  if (!rec || !rec.subscription) return res.status(404).json({ error: "no subscription" });
-  try {
-    await webpush.sendNotification(rec.subscription, JSON.stringify({
-      title: "Finappa",
-      body: "Уведомления работают ✓",
-    }));
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(502).json({ error: "push failed", detail: String(e && e.statusCode) });
-  }
+  const list = pushList(rec);
+  if (!list.length) return res.status(404).json({ error: "no subscription" });
+  if (req.body && req.body.dry) return res.json({ ok: true, dry: true, total: list.length });
+  const r = await pushAll(key, rec, { title: "Finappa", body: "Уведомления работают ✓" });
+  if (!r.sent) return res.status(502).json({ error: "push failed", ...r });
+  res.json({ ok: true, ...r });
+});
+
+/* Состояние подписок: включены ли уведомления ИМЕННО на этом устройстве.
+   Приложение раньше судило по Notification.permission, а это не то же самое:
+   разрешение может быть дано, а подписка на сервере — чужая. */
+app.post("/api/push/state/:key", (req, res) => {
+  const { key } = req.params;
+  if (!KEY_RE.test(key)) return res.status(400).json({ error: "bad key" });
+  const rec = readJson(pushPath(key), null);
+  const list = pushList(rec);
+  const endpoint = String((req.body && req.body.endpoint) || "");
+  res.json({
+    ok: true,
+    devices: list.length,
+    here: !!endpoint && list.some((x) => x.endpoint === endpoint),
+  });
 });
 
 /* Дата ближайшего списания месячной подписки (день с поджимом к концу месяца) */
@@ -253,7 +309,7 @@ async function checkSubscriptionsAndNotify(force) {
   for (const f of files) {
     const key = f.replace(/\.json$/, "");
     const rec = readJson(pushPath(key), null);
-    if (!rec || !rec.subscription) continue;
+    if (!pushList(rec).length) continue;
     const backup = readJson(keyPath(key), null);
     if (!backup) continue;
     let data;
@@ -267,18 +323,16 @@ async function checkSubscriptionsAndNotify(force) {
       if (charge.getTime() !== tomorrow.getTime()) continue;
       const periodKey = `${charge.getFullYear()}-${String(charge.getMonth() + 1).padStart(2, "0")}`;
       if (rec.notified[s.id] === periodKey) continue; // уже уведомляли в этом месяце
-      try {
-        await webpush.sendNotification(rec.subscription, JSON.stringify({
-          title: "Завтра списание",
-          body: `${s.name}: ${s.amount} ${s.currency}. Открой Finappa, чтобы добавить расход.`,
-        }));
+      const r = await pushAll(key, rec, {
+        title: "Завтра списание",
+        body: `${s.name}: ${s.amount} ${s.currency}. Открой Finappa, чтобы добавить расход.`,
+      });
+      if (r.sent) {
         rec.notified[s.id] = periodKey;
         changed = true;
-        console.log(`push sent: ${key.slice(0, 8)}… ${s.name}`);
-      } catch (e) {
-        console.error("push error", e && e.statusCode);
-        if (e && (e.statusCode === 404 || e.statusCode === 410)) { delete rec.subscription; changed = true; break; }
+        console.log(`push sent: ${key.slice(0, 8)}… ${s.name} → ${r.sent}/${r.total}`);
       }
+      if (!pushList(rec).length) break;
     }
     if (changed) writeJson(pushPath(key), rec);
   }
@@ -1016,7 +1070,7 @@ async function remindDrafts(opts) {
   for (const f of files) {
     const key = f.replace(/\.json$/, "");
     const rec = readJson(pushPath(key), null);
-    if (!rec || !rec.subscription) continue;
+    if (!pushList(rec).length) continue;
 
     const uid = userIdOf(key);
     if (only && uid !== only) continue;
@@ -1128,7 +1182,7 @@ async function remindTasks(opts) {
   for (const f of files) {
     const key = f.replace(/\.json$/, "");
     const rec = readJson(pushPath(key), null);
-    if (!rec || !rec.subscription) continue;
+    if (!pushList(rec).length) continue;
 
     const uid = userIdOf(key);
     if (only && uid !== only) continue;
@@ -1141,12 +1195,8 @@ async function remindTasks(opts) {
     for (const p of plan) {
       report.planned.push({ key: key.slice(0, 6), kind: p.kind, title: p.title, body: p.body });
       if (o.dry) continue;
-      try {
-        await webpush.sendNotification(rec.subscription, JSON.stringify({
-          title: p.title,
-          body: p.body,
-          section: "tasks",
-        }));
+      const r = await pushAll(key, rec, { title: p.title, body: p.body, section: "tasks" });
+      if (r.sent) {
         const st = rec.taskReminder || (rec.taskReminder = {});
         if (p.kind === "overdue") st.overdueAt = Date.now();
         else {
@@ -1154,13 +1204,8 @@ async function remindTasks(opts) {
           st.notified[p.id] = today;
         }
         writeJson(pushPath(key), rec);
-      } catch (e) {
-        console.error("task push error", e && e.statusCode);
-        if (e && (e.statusCode === 404 || e.statusCode === 410)) {
-          delete rec.subscription;
-          writeJson(pushPath(key), rec);
-        }
       }
+      if (!pushList(rec).length) break;
     }
     /* Отметки о вчерашних делах не копим: словарь должен оставаться маленьким. */
     if (!o.dry && rec.taskReminder && rec.taskReminder.notified) {
