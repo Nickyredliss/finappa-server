@@ -44,7 +44,7 @@ app.use((req, res, next) => {
 const KEY_RE = /^[a-z0-9][a-z0-9-]{7,63}$/;
 const keyPath = (key) => path.join(DATA_DIR, key + ".json");
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "28", advisor: !!process.env.ANTHROPIC_API_KEY }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "finappa-server", rev: "29", advisor: !!process.env.ANTHROPIC_API_KEY }));
 
 /* ── ТЗ-18: курсы валют ──────────────────────────────────────────────────
    Клиент в третьи руки не ходит: провайдеры режут CORS и просят ключей, а
@@ -831,12 +831,13 @@ const P_COLLS = {
   habits: 500,
   wishes: 500,
   shopping: 500,
+  ideas: 2000,
 };
 const MAX_PTOMB = 20000;
 const MAX_PERSONAL_BYTES = 4 * 1024 * 1024;
 
 const emptyPersonal = () => ({
-  wallets: [], categories: [], txs: [], subscriptions: [], drafts: [], goals: [], tasks: [], habits: [], wishes: [], shopping: [],
+  wallets: [], categories: [], txs: [], subscriptions: [], drafts: [], goals: [], tasks: [], habits: [], wishes: [], shopping: [], ideas: [],
   settings: { updatedAt: 0 },
   pTomb: [],
   rev: 0,
@@ -1169,6 +1170,70 @@ function taskPlan(tasks, hour, today, state) {
   return out;
 }
 
+/* ТЗ-39: оценка длительности дела по формулировке. Это ДОСЛОВНАЯ копия
+   клиентской zSpeed — в тестах обе стороны прогоняются одной таблицей
+   примеров, чтобы копия не разошлась молча. */
+const SPEED_FAST = ["позвонить", "написать", "отправить", "оплатить", "заплатить", "перевести", "купить", "заказать", "забрать", "отнести", "отдать", "вынести", "полить", "помыть", "отмыть", "вымыть", "почистить", "постирать", "выкинуть", "выбросить", "убрать", "записаться", "спросить", "уточнить", "подтвердить", "продлить", "распечатать", "скинуть", "переслать", "зарядить", "проверить"];
+const SPEED_SLOW = ["найти", "искать", "поискать", "выбрать", "изучить", "разобраться", "прочитать", "посмотреть", "смотреть", "придумать", "продумать", "спланировать", "сделать", "создать", "запустить", "настроить", "собрать", "написать статью", "разработать", "оформить", "перевезти", "переехать", "починить", "отремонтировать", "курс", "видео", "тест", "экзамен", "сайт"];
+const SPEED_BOUND = "[^\\p{L}\\p{N}]";
+const speedRe = (w) => new RegExp("(?:^|" + SPEED_BOUND + ")(?:" + w + ")(?:" + SPEED_BOUND + "|$)", "iu");
+function taskSpeed(t) {
+  if (!t) return 2;
+  if (t.slow) return 3;
+  if (t.fast) return 1;
+  const low = String(t.text || "").toLowerCase();
+  const words = low.split(/[^\p{L}\p{N}]+/u).filter(Boolean).length;
+  if (SPEED_SLOW.some((w) => speedRe(w).test(low))) return 3;
+  if (SPEED_FAST.some((w) => speedRe(w).test(low)) && words <= 6) return 1;
+  if (words <= 3) return 1;
+  if (words >= 8) return 3;
+  return 2;
+}
+
+/* Одно быстрое дело раз в день — ответ на «теряюсь, когда не понимаю, что
+   сейчас сделать». Не список: список это снова выбор. */
+const NOW_HOUR = Number(process.env.NOW_HOUR) || 15;
+async function remindNow(opts) {
+  const o = opts || {};
+  const only = o.onlyUid || null;
+  const { hour } = bangkokNow();
+  const report = { hour, planned: [] };
+  if (!o.force && hour !== NOW_HOUR) return report;
+  const today = bkkIso();
+  const files = fs.readdirSync(PUSH_DIR).filter((f) => f.endsWith(".json"));
+  for (const f of files) {
+    const key = f.replace(/\.json$/, "");
+    const rec = readJson(pushPath(key), null);
+    if (!pushList(rec).length) continue;
+    const uid = userIdOf(key);
+    if (only && uid !== only) continue;
+    const personal = readJson(personalPath(uid), null);
+    const tasks = (personal && Array.isArray(personal.tasks) ? personal.tasks : []).filter((t) => t && t.id && t.text && !t.doneAt);
+    if (!tasks.length) continue;
+    const st = rec.nowReminder || {};
+    if (!o.force && st.day === today) continue;
+    const best = tasks
+      .map((t) => ({ t, s: taskSpeed(t) }))
+      .sort((a, b) => a.s - b.s || pNum(a.t.createdAt) - pNum(b.t.createdAt))[0];
+    const title = best.s === 1 ? "⚡ Быстрое дело" : "🕐 Одно дело";
+    report.planned.push({ key: key.slice(0, 6), speed: best.s, title, body: best.t.text });
+    if (o.dry) continue;
+    const r = await pushAll(key, rec, { title, body: best.t.text, section: "now" });
+    if (r.sent) {
+      rec.nowReminder = { day: today, at: Date.now() };
+      writeJson(pushPath(key), rec);
+    }
+  }
+  return report;
+}
+
+setInterval(() => remindNow().catch(() => {}), 60 * 60 * 1000);
+
+app.post("/api/push/now-check", auth, async (req, res) => {
+  const b = req.body || {};
+  res.json(await remindNow({ force: !!b.force, dry: !!b.dry, onlyUid: req.userId }));
+});
+
 async function remindTasks(opts) {
   const o = opts || {};
   const only = o.onlyUid || null;
@@ -1385,6 +1450,7 @@ function advisorDigest(uid) {
     подписки: subs,
     обменыИПереводыЭтогоМесяца: monthTransfers.slice(0, 20).map((t) => advTransferRow(t, wById)),
     итогоПоОбменамЭтогоМесяца: advTransferTotals(monthTransfers),
+    идеи: (p.ideas || []).slice(-60).map((x) => String((x && x.text) || "").slice(0, 200)),
     списокПокупок: (p.shopping || []).filter((x) => x && !x.doneAt).slice(0, 60).map((x) => String(x.text || "").slice(0, 80)),
     купленоНедавно: (p.shopping || []).filter((x) => x && x.doneAt).length,
     черновиковЖдёт: (p.drafts || []).length,
@@ -1644,6 +1710,8 @@ const ADVISOR_APP = [
   "  – Дела: срок можно писать прямо во фразе («позвонить в банк завтра», «оплатить визу 12 сентября», «купить масло на днях»). Кнопка ☀️ ставит дело в план на сегодня, ↩ возвращает обратно.",
   "  – Ежедневник: ежедневные практики, отметка касанием, серия дней.",
     "  – Журнал: что и когда было сделано, по дням.",
+    "  – Идеи: мысли по поводу чего-нибудь. Это НЕ дела: их не делают, их перечитывают. Если мысль дозрела до действия, у неё есть кнопка «→ в дела».",
+  "  – «⚡ Что сделать сейчас» на экране дел: показывает по одному делу от быстрых к долгим, чтобы не выбирать. Кнопки: «Сделал», «Не сейчас», «Это долгое».",
   "  – Покупки: список того, что нужно купить; в магазине строка вычёркивается касанием. Это НЕ дела: продукты и хозяйство живут здесь, чтобы не топить дела. Можешь предложить строку через propose_record с kind=shopping_item.",
   "• Записать трату можно снаружи приложения: Быстрая команда на телефоне шлёт текст в инбокс, оттуда он приходит черновиком.",
 ].join("\n");
